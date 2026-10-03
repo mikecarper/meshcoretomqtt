@@ -1,10 +1,10 @@
-"""Background thread loops for stats logging and WebSocket keepalive."""
+"""Background statistics logging; Paho owns MQTT/WebSocket keepalive."""
 from __future__ import annotations
 
 import logging
 import time
 from time import sleep
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from . import topics
 from .mqtt_publish import publish_status
@@ -27,14 +27,7 @@ def stats_logging_loop(state: BridgeState) -> None:
 
         # Fetch fresh device stats from serial
         logger.debug("[STATS] Fetching fresh device stats from serial...")
-        if state.device:
-            device_stats = state.device.get_device_stats()
-            if device_stats:
-                state.stats['device'] = device_stats
-                logger.debug(f"[STATS] Updated device stats: {device_stats}")
-                publish_status(state, "online")
-            else:
-                logger.debug("[STATS] No device stats received")
+        _refresh_device_stats(state)
 
         # Calculate uptime
         uptime_seconds = int(time.time() - state.stats['start_time'])
@@ -92,7 +85,8 @@ def stats_logging_loop(state: BridgeState) -> None:
             f"RX bytes: {data_str} | "
             f"MQTT: {connected_brokers}/{total_brokers} | "
             f"Reconnects/24h: {reconnect_str} | "
-            f"Failures: {state.stats['publish_failures']}"
+            f"Failures: {state.stats['publish_failures']} | "
+            f"Publish queues: {_publish_pressure_summary(state)}"
         )
 
         # Log device stats separately if available
@@ -104,6 +98,45 @@ def stats_logging_loop(state: BridgeState) -> None:
             state.stats['device_prev'] = state.stats['device'].copy()
 
         state.stats['last_stats_log'] = time.time()
+
+
+def _refresh_device_stats(state: BridgeState) -> None:
+    """Query a stable session reference and discard retired-session results."""
+    device = state.device
+    if device is None:
+        return
+    try:
+        device_stats = device.get_device_stats()
+    except OSError:
+        logger.debug('[STATS] Serial device unavailable during statistics query')
+        return
+    # Reconnect may replace/clear the session while its query is in flight.
+    if state.should_exit or state.device is not device:
+        return
+    if device_stats:
+        state.stats['device'] = device_stats
+        logger.debug(f"[STATS] Updated device stats: {device_stats}")
+        publish_status(state, "online")
+    else:
+        logger.debug("[STATS] No device stats received")
+
+
+def _publish_pressure_summary(state: BridgeState) -> str:
+    """One public counter snapshot per configured broker, every five minutes."""
+    summaries = []
+    broker_count = len(state.config.get('broker', []))
+    for info in list(state.mqtt_clients)[:broker_count]:
+        client = info.get('client')
+        stats = getattr(client, 'publish_stats', None)
+        if stats is None:
+            continue
+        broker = topics.get_broker_config(state, info['broker_idx'])
+        name = broker.get('name', info['broker_idx'])
+        summaries.append(
+            f"{name}:pending={stats['pending_messages']}/{stats['pending_bytes']}B,"
+            f"rejected={stats['rejected']}"
+        )
+    return '; '.join(summaries) if summaries else 'none'
 
 
 def _log_device_stats(state: BridgeState, time_elapsed: float) -> None:
@@ -167,24 +200,3 @@ def _log_device_stats(state: BridgeState, time_elapsed: float) -> None:
 
     if parts:
         logger.info(f"[DEVICE] {' | '.join(parts)}")
-
-
-def websocket_ping_loop(state: BridgeState, broker_idx: int, broker_client: Any, transport: str) -> None:
-    """Send WebSocket PING frames periodically to keep connection alive."""
-    if transport != "websockets":
-        return
-
-    ping_interval = 45
-
-    while broker_idx in state.ws_ping_threads and state.ws_ping_threads[broker_idx].get('active', False):
-        sleep(ping_interval)
-
-        try:
-            raw_client = broker_client.raw_client if hasattr(broker_client, 'raw_client') else None
-            if raw_client and hasattr(raw_client, '_sock') and raw_client._sock:
-                sock = raw_client._sock
-                if hasattr(sock, 'ping'):
-                    sock.ping()
-                    logger.debug(f"[{broker_idx}] Sent WebSocket PING")
-        except Exception as e:
-            logger.debug(f"[{broker_idx}] WebSocket PING failed: {e}")

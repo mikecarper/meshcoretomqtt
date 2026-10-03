@@ -76,9 +76,6 @@ class BridgeState:
         self.token_cache: dict[int, tuple[str, float]] = {}
         self.token_ttl: int = 3600
 
-        # WebSocket ping threads
-        self.ws_ping_threads: dict[int, dict[str, Any]] = {}
-
         # Remote serial config
         remote_cfg = config.get('remote_serial', {})
         self.remote_serial_enabled: bool = remote_cfg.get('enabled', False)
@@ -108,5 +105,8 @@ class BridgeState:
 
         # Message parsing state
         self.last_raw: str | None = None
+        self.last_raw_stamp: tuple[str, str] | None = None
+        self.last_raw_at: float = 0.0
+        self.publish_warning_at: dict[int | None, float] = {}
 
         logger.info("Configuration loaded from TOML")

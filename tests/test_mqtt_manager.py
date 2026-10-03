@@ -1,166 +1,30 @@
-"""Tests for MqttManager orchestration."""
+"""Focused MQTT manager API tests; lifecycle regressions live next door."""
 from __future__ import annotations
 
-import time
-from unittest.mock import patch
-
-import pytest
-
-from bridge.mqtt_manager import MqttManager
-from tests.fakes import FakeBrokerClient, make_test_state, make_config
+from tests.test_mqtt_lifecycle import make_manager
 
 
-class TestMqttManagerCallbacks:
-    def _make_manager(self, **state_kwargs):
-        state = make_test_state(
-            repeater_name="TestNode",
-            repeater_pub_key="AA" * 32,
-            **state_kwargs,
-        )
-        manager = MqttManager(state)
-        state.mqtt_manager = manager
-        return state, manager
-
-    def test_on_connect_sets_connected(self):
-        state, manager = self._make_manager()
-        broker = FakeBrokerClient()
-        broker._connected = True
-        state.mqtt_clients = [{"client": broker, "broker_idx": 0, "connected": False, "connecting_since": 1, "connect_time": 0, "failed_attempts": 0}]
-
-        import threading
-        state.connection_events[0] = threading.Event()
-
-        manager.on_mqtt_connect(None, {'name': 'test', 'broker_idx': 0}, None, 0)
-
-        assert state.mqtt_clients[0]['connected'] is True
-        assert state.mqtt_connected is True
-
-    def test_on_connect_rejects_nonzero_rc(self):
-        state, manager = self._make_manager()
-        import threading
-        state.connection_events[0] = threading.Event()
-
-        manager.on_mqtt_connect(None, {'name': 'test', 'broker_idx': 0}, None, 1)
-        assert state.mqtt_connected is False
-
-    def test_on_disconnect_marks_disconnected(self):
-        state, manager = self._make_manager()
-        state.mqtt_clients = [{"client": FakeBrokerClient(), "broker_idx": 0, "connected": True, "connecting_since": 0, "connect_time": 100, "reconnect_at": 0, "failed_attempts": 0}]
-        state.mqtt_connected = True
-
-        manager.on_mqtt_disconnect(None, {'name': 'test', 'broker_idx': 0}, None, 0, None)
-
-        assert state.mqtt_clients[0]['connected'] is False
-        assert state.mqtt_connected is False
-
-    def test_on_message_ignores_non_serial(self):
-        state, manager = self._make_manager()
-        msg = type('Msg', (), {'topic': 'other/topic', 'payload': b'test'})()
-        # Should not raise
-        manager.on_mqtt_message(None, {'name': 'test', 'broker_idx': 0}, msg)
+def test_callbacks_for_unknown_generation_are_ignored():
+    state, manager, clock, factory = make_manager()
+    manager._ensure_slots()
+    manager.on_mqtt_connect(None, {"broker_idx": 0, "generation": -1}, None, 0)
+    manager.on_mqtt_disconnect(None, {"broker_idx": 0, "generation": -1}, None, 7, None)
+    assert not state.mqtt_connected
+    assert state.mqtt_clients[0]["failed_attempts"] == 0
 
 
-class TestReconnectBehavior:
-    def test_skips_connected_brokers(self):
-        state = make_test_state(repeater_name="TestNode", repeater_pub_key="AA" * 32)
-        manager = MqttManager(state)
-        state.mqtt_manager = manager
+def test_non_serial_mqtt_message_does_not_execute_command():
+    state, manager, clock, factory = make_manager()
+    manager.reconnect_disconnected_brokers()
+    client = factory.clients[0]
+    message = type("Message", (), {"topic": "other/topic", "payload": b"test"})()
+    manager.on_mqtt_message(client, client.userdata, message)
+    assert state.mqtt_clients[0]["connected"]
 
-        broker = FakeBrokerClient()
-        state.mqtt_clients = [{"client": broker, "broker_idx": 0, "connected": True, "connecting_since": 0, "connect_time": 100, "reconnect_at": 0, "failed_attempts": 0}]
 
-        # Should not attempt reconnect for connected broker
-        manager.reconnect_disconnected_brokers()
-        assert state.mqtt_clients[0]['connected'] is True
-
-    def test_clears_token_cache_on_reconnect(self):
-        config = make_config()
-        state = make_test_state(
-            config=config,
-            repeater_name="TestNode",
-            repeater_pub_key="AA" * 32,
-        )
-        manager = MqttManager(state)
-        state.mqtt_manager = manager
-
-        state.token_cache[0] = ("cached_token", 1000)
-
-        broker = FakeBrokerClient()
-        state.mqtt_clients = [{
-            "client": broker,
-            "broker_idx": 0,
-            "connected": False,
-            "connecting_since": 0,
-            "connect_time": 100,
-            "reconnect_at": 0,
-            "reconnect_delay": 1.0,
-            "failed_attempts": 0,
-        }]
-
-        # Reconnect will try to create a new client, which may fail since
-        # there's no real MQTT server, but it should clear the token cache
-        manager.reconnect_disconnected_brokers()
-        assert 0 not in state.token_cache
-
-    def test_backoff_is_independent_per_broker(self):
-        """Two brokers maintain separate reconnect_delay counters.
-
-        Broker 0 fails repeatedly so its backoff grows.
-        Broker 1 stays connected throughout, then disconnects.
-        Broker 1's reconnect_delay must still be 1.0 — unaffected by broker 0.
-        When broker 1 subsequently fails its first reconnect attempt its own
-        backoff starts at 1.0 and grows independently from broker 0's.
-        """
-        config = make_config()
-        config['broker'] = [
-            {'name': 'b0', 'enabled': True, 'server': 'host0', 'port': 1883,
-             'transport': 'tcp', 'qos': 0, 'retain': False,
-             'auth': {'method': 'none'}, 'tls': {'enabled': False}},
-            {'name': 'b1', 'enabled': True, 'server': 'host1', 'port': 1883,
-             'transport': 'tcp', 'qos': 0, 'retain': False,
-             'auth': {'method': 'none'}, 'tls': {'enabled': False}},
-        ]
-        state = make_test_state(config=config, repeater_name="Node", repeater_pub_key="AA" * 32)
-        manager = MqttManager(state)
-        state.mqtt_manager = manager
-
-        def make_client_info(idx, connected):
-            return {
-                'client': FakeBrokerClient(),
-                'broker_idx': idx,
-                'connected': connected,
-                'connecting_since': 0,
-                'connect_time': time.time() - 300 if connected else 0,
-                'reconnect_at': 0,
-                'reconnect_delay': 1.0,
-                'failed_attempts': 0,
-            }
-
-        state.mqtt_clients = [make_client_info(0, False), make_client_info(1, True)]
-        state.mqtt_connected = True
-
-        # Fail broker 0 five times — its delay should grow: 1.0 → 1.5 → 2.25 → 3.375 → 5.06 → 7.59
-        with patch.object(manager, '_create_and_connect_broker', return_value=None):
-            for _ in range(5):
-                state.mqtt_clients[0]['reconnect_at'] = 0
-                manager.reconnect_disconnected_brokers()
-
-        assert state.mqtt_clients[0]['reconnect_delay'] == pytest.approx(1.0 * 1.5 ** 5, rel=1e-3)
-        assert state.mqtt_clients[1]['reconnect_delay'] == 1.0, \
-            "broker 1 delay must be unaffected by broker 0 failures"
-
-        # Broker 1 disconnects — reconnect_at should use its own delay (1.0)
-        t_before = time.time()
-        manager.on_mqtt_disconnect(None, {'name': 'b1', 'broker_idx': 1}, None, 0, None)
-        t_after = time.time()
-
-        assert state.mqtt_clients[1]['reconnect_delay'] == 1.0
-        assert t_before + 1.0 <= state.mqtt_clients[1]['reconnect_at'] <= t_after + 1.0
-
-        # Broker 1 fails its first reconnect — its own backoff starts from 1.0
-        with patch.object(manager, '_create_and_connect_broker', return_value=None):
-            state.mqtt_clients[1]['reconnect_at'] = 0
-            manager.reconnect_disconnected_brokers()
-
-        assert state.mqtt_clients[1]['reconnect_delay'] == pytest.approx(1.5, rel=1e-3), \
-            "broker 1 first failure must grow from 1.0, not from broker 0's grown value"
+def test_repeated_slot_setup_does_not_duplicate_enabled_brokers():
+    state, manager, clock, factory = make_manager()
+    for _ in range(20):
+        manager._ensure_slots()
+    assert len(state.mqtt_clients) == 1
+    assert len(state.connection_events) == 1

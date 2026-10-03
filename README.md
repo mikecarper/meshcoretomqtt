@@ -5,9 +5,9 @@ analysis. Requires a MeshCore repeater to be connected to a Raspberry Pi,
 server, or similar device running Python.
 
 The goal is to have multiple repeaters logging data to the same MQTT server so
-you can easily troubleshoot packets through the mesh. You will need to build a
-custom image with packet logging and/or debug for your repeater to view the
-data.
+you can easily troubleshoot packets through the mesh. Your repeater firmware
+must support USB packet logging. Some builds enable it at runtime; others need
+a custom image with packet logging compiled in.
 
 The parser supports the current MeshCore packet log variants from `main`,
 including repeater packet logs without `hash=` and dispatcher/serial logs that
@@ -112,7 +112,13 @@ services.mctomqtt = {
 
 1. Setup a Raspberry Pi (Zero / 2 / 3 or 4 recommended) or similar Linux/macOS
    device
-2. Build/flash a MeshCore repeater with appropriate build flags:
+2. Enable USB packet logging on a MeshCore repeater. If its CLI supports
+   `set usb.logging on`, use that saved runtime setting on the normal artifact.
+   Builds offering `set logging.output usb` can select USB forwarding without
+   also publishing directly over WiFi. Do not simultaneously run a Binary
+   Companion client or another serial logger on the same port.
+
+   Otherwise, build/flash a repeater with appropriate build flags:
 
    **Recommended minimum:**
    ```
@@ -126,6 +132,11 @@ services.mctomqtt = {
 
 3. Plug the repeater into the device via USB (RAK or Heltec tested)
 4. Configure the repeater with a unique name as per MeshCore guides
+
+On Linux, prefer the radio's `/dev/serial/by-id/...` path in `[serial].ports`
+instead of a renumberable `/dev/ttyACM0`. The bridge requests exclusive serial
+ownership on POSIX systems. Keep firmware debug output and bridge DEBUG logging
+off unless troubleshooting; packet logging does not require debug spam.
 
 ### Software Requirements
 
@@ -154,6 +165,10 @@ Test tiers:
 - End-to-end tests are opt-in with `MCTOMQTT_TEST_E2E=1`.
 
 Pull requests automatically run the GitHub Actions test workflow on Ubuntu. That job executes `python -m pytest tests/ -m "not e2e"`, which includes the normal unit suite plus any network/system tests that work in the runner, while still excluding opt-in e2e coverage that requires real services or devices.
+
+The NixOS VM check verifies generated configuration and service settings using
+the production readiness/watchdog notifier. It does not exercise radio capture
+or live MQTT transport.
 
 ## Directory Layout
 
@@ -424,10 +439,24 @@ docker build -t mctomqtt:latest /path/to/meshcoretomqtt
 docker run -d \
   --name mctomqtt \
   --restart unless-stopped \
+  --memory=256m --memory-swap=256m --pids-limit=64 \
+  --log-driver=json-file --log-opt=max-size=10m --log-opt=max-file=3 \
   -v /path/to/mctomqtt-config:/etc/mctomqtt:ro \
   --device=/dev/ttyACM0 \
   mctomqtt:latest
 ```
+
+These limits are also used by the installer and Docker updater. An existing
+container must be recreated to adopt them. Docker's restart policy handles
+exits, not a hung-but-running process; the systemd progress watchdog described
+below is not enabled merely by running the same image in Docker.
+Docker also pins the device passed with `--device`: if USB re-enumeration
+changes its device number, recreate the container with the current device.
+A persistent `/dev/serial/by-id/...` host path alone does not update that
+container mapping. Do not use privileged mode just to work around this.
+Fork, non-main branch and local-source installations build the selected source
+instead of pulling Cisien's upstream `latest` image. Upstream/main installations
+still try that published image first, with a local build fallback.
 
 ### 3. Manual Execution
 
@@ -441,6 +470,97 @@ With debug output:
 ```bash
 sudo -u mctomqtt ./venv/bin/python3 mctomqtt.py --config /etc/mctomqtt/config.toml --debug
 ```
+
+## USB and Host Reliability
+
+USB logging remains a best-effort capture, not durable storage. A dedicated
+reader keeps draining the radio while DNS, TLS or MQTT reconnects are slow.
+Commands and packet logs are demultiplexed by that one reader; stats queries no
+longer purge pending packets. POSIX serial opens request exclusive ownership.
+Statistics polling retains one session reference during reconnect and ignores
+results from retired sessions, so a disconnected port cannot stop the worker
+or replace current statistics with a late reply.
+
+The defaults bound unfinished lines to 4096 bytes, queued log records to 256,
+and complete command responses to 64 KiB. Lines without a terminator are
+discarded after 5 seconds, through the next newline. Queue overflow drops
+oldest whole records and emits `DROP:<count>`. A drop, invalid RAW record,
+mismatched timestamp/length or expired pairing clears the cached RAW payload;
+a valid RAW record is consumed by only one packet summary. A summary can
+therefore legitimately contain `"raw": null` after capture loss. Matching
+timestamps and lengths are safeguards, not unique packet identifiers.
+
+Serial writes have a 2-second timeout. CLI query deadlines default to 10
+seconds and include time spent waiting for command ownership and writing.
+Full Companion's bare ASCII replies also work when its unframed `> ` prompt
+is immediately followed by a packet/debug log: the prompt ends the reply and
+the following log stays in the capture queue. A prompt before the first reply
+does not complete the command.
+Malformed stats replies and fields are ignored without discarding other valid
+stats. Stats must be JSON objects containing finite, float-representable numeric values, not strings
+or booleans. Negative noise measurements are valid; counters, airtime and
+battery readings must be nonnegative.
+
+After a write/reply timeout the serial session is closed, since this ASCII
+protocol has no transaction IDs with which to identify a late response. The
+main loop reopens the port and verifies that its public key still matches the
+startup radio before resuming capture. `serial.watchdog_timeout = 0` really disables the
+idle reconnect watchdog; quiet meshes are not unhealthy merely because they
+have no packets.
+
+Each broker is bounded to 256 outstanding publications and 256 KiB of
+UTF-8 topic/payload data plus conservative wire overhead, including QoS 0.
+Offline or full brokers drop new publications instead of accumulating an
+unlimited backlog. Accepted is not the same as delivered: QoS 0 completion
+means handed to the socket, not acknowledged by the broker. A publication
+pending for 120 seconds causes that connection to be retired. These defaults
+can be tuned with the serial/broker options in `config.toml.example`.
+
+One supervisor owns broker reconnects, with persistent per-broker backoff and
+failure counts. MQTT authentication rejection, missing CONNACK and short-lived
+connections count as failures even after a successful transport handshake.
+Counters reset only after 120 seconds of stable connection; 12 consecutive
+failures request a service restart. Standard MQTT keepalive also works over
+WebSockets; no extra WebSocket ping threads are created. TCP setup has a
+30-second timeout, but DNS resolution and TLS do not have a guaranteed total
+30-second deadline.
+
+Outage/backpressure warnings are rate-limited to once per broker per 30
+seconds; dropped-publication counters and periodic queue statistics still
+show pressure. Leave the bridge at INFO for normal operation.
+
+The supplied Linux systemd unit and NixOS service use a real progress watchdog:
+readiness is announced after USB initialization, not after all brokers connect.
+The main loop sends watchdog notifications only while it and the supervisor
+make progress. After a supervisor stall of more than 120 seconds, notifications
+stop; systemd's 180-second watchdog then restarts the service. Broker outages
+alone do not suppress heartbeats while reconnection continues to progress.
+Direct runs, launchd and Docker do not receive this systemd watchdog protection.
+
+The systemd defaults are `MemoryHigh=192M`, `MemoryMax=256M`,
+`MemorySwapMax=0`, and `TasksMax=64`. These require the corresponding kernel
+cgroup support. Adjust them with a service drop-in for unusually large broker
+configurations, rather than removing all limits. Docker installs/updates use
+a 256 MiB memory/no-extra-swap limit, 64 PIDs, and three rotating 10 MiB log
+files. Install/update the service unit or recreate the container as well as
+updating Python files; existing deployments do not inherit new limits by magic.
+
+### When the Pi Also Loses SSH
+
+A bridge failure, memory pressure, lost networking, power trouble, SD-card
+errors and a kernel failure are different diagnoses. None of these safeguards
+proves the cause of a previous incident. After recovery, collect the bridge
+version, broker presets, installation type, and previous-boot logs:
+
+```bash
+journalctl -b -1 -k --no-pager
+journalctl -b -1 -u mctomqtt --no-pager
+```
+
+Previous-boot logs require persistent journaling. Look for out-of-memory kills,
+blocked tasks, USB resets, filesystem errors and undervoltage, and compare the
+timestamps with MQTT reconnect/rejection events. Redact keys, tokens and other
+credentials before sharing logs.
 
 ## Updates
 

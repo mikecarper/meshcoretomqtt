@@ -6,12 +6,25 @@
     lib,
     ...
   }: let
-    # Mock package for testing — just sleeps so systemd sees it as running
+    # Exercise the production notifier without requiring a radio or broker.
+    healthModule = pkgs.writeTextDir "service_health.py"
+      (builtins.readFile ../bridge/service_health.py);
+    healthTest = pkgs.writeText "mctomqtt-health-test.py" ''
+      import time
+      from service_health import ServiceHealth
+
+      health = ServiceHealth()
+      if not health.ready():
+          raise RuntimeError("systemd readiness notification failed")
+      while True:
+          health.tick()
+          time.sleep(0.1)
+    '';
     mockMctomqtt = pkgs.writeShellApplication {
       name = "mctomqtt";
       text = ''
-        echo "Mock mctomqtt service started with args: $*"
-        while true; do sleep 10; done
+        export PYTHONPATH=${healthModule}
+        exec ${pkgs.python3}/bin/python3 ${healthTest} "$@"
       '';
     };
   in {
@@ -28,7 +41,7 @@
         services.mctomqtt = {
           enable = true;
           package = mockMctomqtt;
-          iata = "TEST";
+          iata = "SEA";
           serialPorts = ["/dev/ttyS1"];
           defaults.letsmesh-us.enable = false;
           defaults.letsmesh-eu.enable = true;
@@ -86,7 +99,7 @@
         config = tomllib.loads(config_toml)
 
         with subtest("General section"):
-            assert config["general"]["iata"] == "TEST", f"iata: {config['general']['iata']}"
+            assert config["general"]["iata"] == "SEA", f"iata: {config['general']['iata']}"
             assert config["general"]["log_level"] == "DEBUG", f"log_level: {config['general']['log_level']}"
             assert config["general"]["sync_time"] is True, f"sync_time: {config['general']['sync_time']}"
 
@@ -151,7 +164,10 @@
         with subtest("Service user and security"):
             machine.succeed("systemctl show mctomqtt.service | grep -q 'User=mctomqtt'")
             machine.succeed("systemctl show mctomqtt.service | grep -q 'Group=mctomqtt'")
-            machine.succeed("systemctl show mctomqtt.service | grep -q 'Restart=on-failure'")
+            machine.succeed("systemctl show mctomqtt.service | grep -q 'Restart=always'")
+            machine.succeed("systemctl show mctomqtt.service | grep -q 'Type=notify'")
+            machine.succeed("systemctl show mctomqtt.service | grep -q 'NotifyAccess=main'")
+            machine.succeed("systemctl show mctomqtt.service | grep -q 'WatchdogUSec=3min'")
 
         with subtest("Service restart"):
             machine.succeed("systemctl restart mctomqtt.service")

@@ -37,7 +37,7 @@ The runtime codebase is a `bridge/` Python package with a thin entry point (proj
 - **`mctomqtt.py`** — Thin entry point (~45 lines). Keeps `__version__`, argparse, logging setup. Creates `MeshCoreBridge(config, debug, version)` and calls `bridge.run()`.
 
 - **`bridge/`** — Python package containing all application logic, split into focused modules:
-  - **`serial_connection.py`** — `SerialConnection` ABC + `RealSerialConnection` (device I/O with internal locking) + `connect()` factory
+  - **`serial_connection.py`** - `SerialConnection` ABC + `RealSerialConnection` (one continuous bounded reader, command/log demultiplexing and deadline-aware command locking) + `connect()` factory
   - **`auth_provider.py`** — `AuthProvider` ABC + `MeshCoreAuthProvider` (wraps `auth_token.py`)
   - **`broker_client.py`** — `BrokerClient` ABC + `PahoBrokerClient` (wraps paho-mqtt)
   - **`state.py`** — `BridgeState` shared mutable state container (all ~30 instance variables)
@@ -45,8 +45,9 @@ The runtime codebase is a `bridge/` Python package with a thin entry point (proj
   - **`mqtt_publish.py`** — `safe_publish()`, `build_status_message()`, `publish_status()`
   - **`message_parser.py`** — `RAW_PATTERN`, `PACKET_PATTERN`, `parse_and_publish()`
   - **`remote_serial.py`** — Remote serial command handling, nonce management, JWT validation
-  - **`background.py`** — `stats_logging_loop()`, `websocket_ping_loop()`
-  - **`mqtt_manager.py`** — `MqttManager` class orchestrating broker connections, reconnection, callbacks
+  - **`background.py`** - `stats_logging_loop()` and bounded queue diagnostics
+  - **`mqtt_manager.py`** - `MqttManager` with one background lifecycle supervisor, generation-checked callbacks and persistent per-broker retry state
+  - **`service_health.py`** - Optional systemd readiness/progress watchdog notifications, using only the standard library
   - **`runner.py`** — `run()` main loop, `handle_signal()`, `wait_for_system_time_sync()`
   - **`__init__.py`** — `MeshCoreBridge` facade class
 
@@ -104,6 +105,9 @@ See `config.toml.example` for the full reference with all options and defaults.
 ## Key Patterns
 
 - **Thread safety:** Serial port access is protected by internal locking in `RealSerialConnection`. The main loop, stats thread, and remote serial handler all call methods on the `SerialConnection` ABC — the lock is never exposed to callers.
+- **Bounded capture:** Only the serial reader reads bytes. Commands must not purge RX buffers or consume packet records. Default line/queue bounds are 4096 bytes/256 records; whole-record drops report `DROP:<count>`. Writes and command-lock/reply waits have finite deadlines. A timed-out command closes the session to quarantine late replies.
+- **Bounded MQTT:** `PahoBrokerClient` reserves message/byte credits before publishing, including QoS 0. Public `MQTTMessageInfo` receipts reconcile callback-before-return races and MID reuse. Never assume Paho's queue limit covers QoS 0. Manager owns reconnects; Paho automatic reconnect is disabled. Remove no-op/manual WebSocket keepalive workers rather than reintroducing a shared stop flag.
+- **Lifecycle/health:** Start/stop broker work through the manager supervisor, not the USB main loop. Retain retry counts across successful transport setup and reject stale-generation callbacks. Watchdog notifications require progress from both the main loop and supervisor; idle meshes remain healthy. DNS is not guaranteed cancellable. Keep systemd, Docker installer/updater, NixOS, tests and deployment docs aligned when changing resource defaults.
 - **MQTT auth:** Two modes per broker — username/password or JWT auth tokens (generated from device's Ed25519 private key). Tokens are cached with TTL. Auth operations go through the `AuthProvider` ABC.
 - **Graceful shutdown:** SIGTERM/SIGINT handlers set `state.should_exit = True`. The main loop checks this flag each iteration.
 - **Config access:** `state.config` dict with `state.config.get('section', {}).get('key', default)`. Broker configs accessed via `topics.get_broker_config(state, broker_idx)`.
@@ -125,6 +129,11 @@ See `config.toml.example` for the full reference with all options and defaults.
 - **`@pytest.mark.network`:** Tests needing internet (IATA API, download, bootstrap `--help`). Run by default; skip with `MCTOMQTT_SKIP_NETWORK=1`.
 - **`@pytest.mark.system`:** Tests needing root + Linux (permissions, service user creation, systemd). Auto-skipped when not root; also skip with `MCTOMQTT_SKIP_SYSTEM=1`.
 - **`@pytest.mark.e2e`:** Tests needing real services/devices. Opt-in only: `MCTOMQTT_TEST_E2E=1`.
+
+The NixOS VM check in `nix/nixos-test.nix` uses the production `ServiceHealth`
+notifier to exercise readiness and watchdog-compatible unit settings. It is
+not an end-to-end radio/MQTT test. Keep its IATA and restart assertions aligned
+with the NixOS module.
 
 **PR CI:** `.github/workflows/pr-tests.yaml` runs on `pull_request` and executes `python -m pytest tests/ -m "not e2e"` on Ubuntu. This includes the default unit tests plus any network/system tests that are functional in the GitHub runner, while still excluding opt-in e2e coverage that needs real services or devices.
 
@@ -160,7 +169,7 @@ The installer is a Python package (`installer/`) with thin bash bootstraps. Pyth
 
 - **`pyproject.toml`** — Project metadata, Python version requirement (>=3.11), and pytest configuration.
 - **`uninstall.sh`** — Interactive uninstaller that detects the service user from the systemd unit, stops/removes the service, offers config backup, and cleans up `/opt/mctomqtt/` and `/etc/mctomqtt/`.
-- **`Dockerfile`** — Alpine build that includes all Python dependencies. Config mounted at `/etc/mctomqtt/config.toml`.
+- **`Dockerfile`** - Alpine build that includes all Python dependencies. Config mounted at `/etc/mctomqtt/config.toml`. Only upstream/main remote installs pull Cisien's registry image; fork, custom-branch and local-source installs/updates build selected sources instead.
 - **`mctomqtt.service`** — systemd unit template with security hardening (NoNewPrivileges, ProtectSystem, PrivateTmp).
 - **`com.meshcore.mctomqtt.plist`** — macOS launchd plist for system-level daemon at `/Library/LaunchDaemons/`.
 - **`configs/`** — User-contributed configuration examples.

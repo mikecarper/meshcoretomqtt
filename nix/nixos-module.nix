@@ -228,9 +228,18 @@
         wantedBy = ["multi-user.target"];
 
         serviceConfig = {
-          Type = "simple";
+          Type = "notify";
+          NotifyAccess = "main";
+          TimeoutStartSec = 300;
+          TimeoutStopSec = 20;
+          WatchdogSec = 180;
+          MemoryHigh = "192M";
+          MemoryMax = "256M";
+          MemorySwapMax = 0;
+          TasksMax = 64;
           ExecStart = "${cfg.package}/bin/mctomqtt --config ${configFile}";
-          Restart = "on-failure";
+          Restart = "always";
+          RestartSec = 10;
 
           # Run as dedicated user
           User = "mctomqtt";

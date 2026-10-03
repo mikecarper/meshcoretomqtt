@@ -27,6 +27,7 @@ from .system import (
     create_venv,
     detect_service_user,
     detect_system_type,
+    docker_run_command,
     download_repo_archive,
     install_systemd_service,
     pull_or_build_docker_image,
@@ -232,13 +233,9 @@ def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
                         if match:
                             serial_device = match.group(1)
 
-                    parts: list[str] = [
-                        "docker", "run", "-d", "--name", "mctomqtt", "--restart", "unless-stopped",
-                        "-v", f"{ctx.config_dir}:/etc/mctomqtt:ro",
-                    ]
+                    parts = docker_run_command(ctx.config_dir, image)
                     if Path(serial_device).exists():
-                        parts.append(f"--device={serial_device}")
-                    parts.append(image)
+                        parts.insert(-1, f"--device={serial_device}")
 
                     result = run_cmd(parts, check=False)
                     if result.returncode == 0:

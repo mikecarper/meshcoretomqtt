@@ -25,14 +25,30 @@ log_level = "INFO"
 sync_time = true
 
 [serial]
-# Serial ports to try connecting to (first successful port is used)
+# Serial ports to try connecting to (first successful port is used).
+# Prefer /dev/serial/by-id/... on Linux; only this bridge should open the port.
 ports = ["/dev/ttyACM0"]
 
 # Serial baud rate
 baud_rate = 115200
 
-# Serial read timeout in seconds
+# Legacy read timeout, used only as an upper bound for the reader polling wait.
+# Command deadlines are independent; USB is drained continuously in a worker.
 timeout = 2
+
+# Short reader poll, in seconds (capped at 0.1 for responsive shutdown)
+reader_timeout = 0.1
+
+# Bounds on individual lines and queued unsolicited logs (oldest logs dropped)
+max_line_bytes = 4096
+max_pending_lines = 256
+
+# Discard an unfinished line after this many seconds, through the next newline
+line_timeout = 5.0
+
+# Finite write deadline and total default CLI query deadline, in seconds
+write_timeout = 2.0
+command_timeout = 10.0
 
 # Watchdog: seconds with no data before forcing serial reconnect (0 to disable)
 watchdog_timeout = 900
@@ -103,6 +119,10 @@ branch = "main"
 # port = 1883
 # transport = "tcp"          # "tcp" or "websockets"
 # keepalive = 60
+# connect_timeout = 30.0     # TCP setup; DNS is not covered by this timeout
+# publish_timeout = 120.0    # Retire a connection if a publish remains pending
+# max_pending_messages = 256
+# max_pending_bytes = 262144 # UTF-8 topic + payload + conservative wire overhead
 # client_id_prefix = "meshcore_"
 # qos = 0
 # retain = true

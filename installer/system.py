@@ -444,16 +444,22 @@ def docker_cmd() -> str | None:
 
 
 def pull_or_build_docker_image(ctx: InstallerContext) -> str | None:
-    """Pull image from GHCR or fall back to a local build. Returns image name or None."""
-    print_info("Attempting to pull image from registry...")
-    result = run_cmd(["docker", "pull", GHCR_IMAGE], check=False, capture=True)
-    if result.returncode == 0:
-        print_success("Image pulled successfully from registry")
-        run_cmd(["docker", "tag", GHCR_IMAGE, LOCAL_IMAGE], check=False)
-        return LOCAL_IMAGE
-
-    print_warning("Failed to pull image from registry (network issue or image not available)")
-    print_info("Falling back to local build...")
+    """Use the upstream image only for upstream/main, else build selected sources."""
+    registry_image = _docker_registry_image(ctx)
+    if registry_image is not None:
+        print_info("Attempting to pull image from registry...")
+        result = run_cmd(["docker", "pull", registry_image], check=False, capture=True)
+        if result.returncode == 0:
+            result = run_cmd(["docker", "tag", registry_image, LOCAL_IMAGE], check=False)
+            if result.returncode == 0:
+                print_success("Image pulled successfully from registry")
+                return LOCAL_IMAGE
+            print_warning("Pulled image could not be tagged for deployment")
+        else:
+            print_warning("Failed to pull image from registry (network issue or image not available)")
+        print_info("Falling back to local build...")
+    else:
+        print_info("Building selected fork, branch or local sources instead of the upstream image...")
 
     dockerfile_path = Path(ctx.install_dir) / "Dockerfile"
     if not dockerfile_path.exists():
@@ -477,6 +483,14 @@ def pull_or_build_docker_image(ctx: InstallerContext) -> str | None:
     print_success("Docker image built successfully")
     print()
     return LOCAL_IMAGE
+
+
+def _docker_registry_image(ctx: InstallerContext) -> str | None:
+    """A registry image must not silently replace a fork/branch/local checkout."""
+    if (ctx.repo.lower() == "cisien/meshcoretomqtt" and ctx.branch == "main"
+            and not ctx.local_install):
+        return GHCR_IMAGE
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -725,13 +739,21 @@ After=time-sync.target network-online.target
 Wants=time-sync.target network-online.target
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=300
+TimeoutStopSec=20
+WatchdogSec=180
 User={svc_user}
 Group={svc_user}
 WorkingDirectory={install_dir}
 ExecStart={install_dir}/venv/bin/python3 {install_dir}/mctomqtt.py
 Restart=always
 RestartSec=10
+MemoryHigh=192M
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=64
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -864,15 +886,11 @@ def install_docker_service(ctx: InstallerContext) -> bool:
             serial_device = match.group(1)
 
     # Build docker run command
-    parts = [
-        "docker", "run", "-d", "--name", "mctomqtt", "--restart", "unless-stopped",
-        "-v", f"{ctx.config_dir}:/etc/mctomqtt:ro",
-    ]
+    parts = docker_run_command(ctx.config_dir, image)
     if Path(serial_device).exists():
-        parts.append(f"--device={serial_device}")
+        parts.insert(-1, f"--device={serial_device}")
     else:
         print_warning(f"Serial device {serial_device} not found - container will start but may not connect")
-    parts.append(image)
 
     print()
     print_info("Docker run command:")
@@ -895,6 +913,16 @@ def install_docker_service(ctx: InstallerContext) -> bool:
             return False
 
     return True
+
+
+def docker_run_command(config_dir: str, image: str) -> list[str]:
+    """Build bounded deployment defaults without invoking Docker."""
+    return [
+        "docker", "run", "-d", "--name", "mctomqtt", "--restart", "unless-stopped",
+        "--memory=256m", "--memory-swap=256m", "--pids-limit=64",
+        "--log-driver=json-file", "--log-opt=max-size=10m", "--log-opt=max-file=3",
+        "-v", f"{config_dir}:/etc/mctomqtt:ro", image,
+    ]
 
 
 # ---------------------------------------------------------------------------

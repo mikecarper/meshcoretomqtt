@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -15,6 +16,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _warn_dropped(state: BridgeState, broker_idx: int | None, message: str) -> None:
+    """Rate-limit outage/backpressure warnings without hiding drop counters."""
+    now = time.monotonic()
+    previous = state.publish_warning_at.get(broker_idx)
+    if previous is None or now - previous >= 30:
+        logger.warning(message)
+        state.publish_warning_at[broker_idx] = now
+
+
 def safe_publish(
     state: BridgeState,
     topic_type: str,
@@ -25,21 +35,25 @@ def safe_publish(
 ) -> bool:
     """Publish to one or all MQTT brokers."""
     if not state.mqtt_connected:
-        logger.warning(f"Not connected - skipping publish to {topic_type}")
+        _warn_dropped(state, None, f"Not connected - dropping publish to {topic_type}")
         state.stats['publish_failures'] += 1
         return False
 
     success = False
 
     if client:
-        clients_to_publish = [info for info in state.mqtt_clients if info['client'] is client]
+        clients_to_publish = [info for info in list(state.mqtt_clients) if info.get('client') is client]
     else:
-        clients_to_publish = state.mqtt_clients
+        clients_to_publish = list(state.mqtt_clients)
 
     for mqtt_client_info in clients_to_publish:
         bidx = mqtt_client_info['broker_idx']
         broker = topics.get_broker_config(state, bidx)
         broker_name = broker.get('name', f'broker-{bidx}')
+        if not mqtt_client_info.get('connected') or mqtt_client_info.get('client') is None:
+            state.stats['publish_failures'] += 1
+            _warn_dropped(state, bidx, f"[{broker_name}] Disconnected - dropping publish")
+            continue
 
         topic = topics.get_topic(state, topic_type, bidx)
         if not topic:
@@ -53,13 +67,13 @@ def safe_publish(
 
             result = broker_client.publish(topic, payload, qos=qos, retain=retain)
             if not result:
-                logger.error(f"[{broker_name}] Publish failed to {topic}")
+                _warn_dropped(state, bidx, f"[{broker_name}] Publish rejected (disconnected or queue full)")
                 state.stats['publish_failures'] += 1
             else:
-                logger.debug(f"[{broker_name}] Published to {topic}")
+                logger.debug(f"[{broker_name}] Accepted publish to {topic}")
                 success = True
         except Exception as e:
-            logger.error(f"[{broker_name}] Publish error to {topic}: {str(e)}")
+            _warn_dropped(state, bidx, f"[{broker_name}] Publish error to {topic}: {str(e)}")
             state.stats['publish_failures'] += 1
 
     return success

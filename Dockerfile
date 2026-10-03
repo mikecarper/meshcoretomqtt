@@ -1,6 +1,8 @@
 # Basic container
 # Example usage:
 #   docker run -d --name mctomqtt \
+#     --memory=256m --memory-swap=256m --pids-limit=64 \
+#     --log-driver=json-file --log-opt=max-size=10m --log-opt=max-file=3 \
 #     -v ./config.toml:/etc/mctomqtt/config.toml \
 #     --device=/dev/ttyACM0 \
 #     meshcoretomqtt:latest

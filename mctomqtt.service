@@ -4,7 +4,11 @@ After=time-sync.target network-online.target
 Wants=time-sync.target network-online.target
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=300
+TimeoutStopSec=20
+WatchdogSec=180
 User=mctomqtt
 Group=mctomqtt
 WorkingDirectory=/opt/mctomqtt
@@ -12,6 +16,10 @@ ExecStart=/opt/mctomqtt/venv/bin/python3 /opt/mctomqtt/mctomqtt.py
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
 Restart=always
 RestartSec=10
+MemoryHigh=192M
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=64
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

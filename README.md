@@ -60,6 +60,9 @@ cd meshcoretomqtt
 sudo LOCAL_INSTALL=$(pwd) ./install.sh
 ```
 
+Install/update stages the bridge package before replacement, including when
+the local checkout and installation directory are the same path.
+
 ### NixOS
 
 configuration.nix:
@@ -370,6 +373,11 @@ The script will:
 **Note:** The private key is read directly from the device and used for signing
 only. It's never transmitted or saved to disk.
 
+For standalone token generation, `auth_token.py PUBLIC_KEY PRIVATE_KEY`
+accepts either an inline hexadecimal private key or a path to an existing key
+file, including long paths. Whitespace is removed from hexadecimal keys in
+both forms.
+
 
 ### Additional Settings
 
@@ -529,7 +537,8 @@ Statistics polling retains one session reference during reconnect and ignores
 results from retired sessions, so a disconnected port cannot stop the worker
 or replace current statistics with a late reply.
 Shutdown wakes an idle statistics worker immediately instead of waiting for
-its five-minute polling interval.
+its five-minute polling interval. Device reboots and counter resets establish
+a fresh statistics baseline, avoiding negative airtime and error rates.
 
 The defaults bound unfinished lines to 4096 bytes, queued log records to 256,
 and complete command responses to 64 KiB. Lines without a terminator are
@@ -539,6 +548,8 @@ mismatched timestamp/length, malformed packet summary or expired pairing clears 
 a valid RAW record is consumed by only one packet summary. A summary can
 therefore legitimately contain `"raw": null` after capture loss. Matching
 timestamps and lengths are safeguards, not unique packet identifiers.
+Interleaved DEBUG text preserves that pair even when it quotes packet records
+or debug publishing is disabled.
 
 Serial writes have a 2-second timeout. CLI query deadlines default to 10
 seconds and include time spent waiting for command ownership and writing.
@@ -546,6 +557,8 @@ Full Companion's bare ASCII replies also work when its unframed `> ` prompt
 is immediately followed by a packet/debug log: the prompt ends the reply and
 the following log stays in the capture queue. A prompt before the first reply
 does not complete the command.
+Leftover prompts may also precede the next framed reply when command echo is
+disabled.
 Getter replies support both Full Companion's indented `  > value` and legacy
 `  -> >value` framing, so names containing `DEBUG`, `BLE:`, `RAW:` or `RX,`
 remain values. Complete names and radio values survive embedded `-> >` text.
@@ -572,6 +585,8 @@ unlimited backlog. Accepted is not the same as delivered: QoS 0 completion
 means handed to the socket, not acknowledged by the broker. A publication
 pending for 120 seconds causes that connection to be retired. These defaults
 can be tuned with the serial/broker options in `config.toml.example`.
+If publishing raises after data may have been queued, its reserved capacity
+remains counted until the connection is retired.
 Failed connections close immediately, including during reconnect backoff,
 without suppressing the broker's offline Last Will.
 
@@ -650,6 +665,15 @@ Or re-run the installer — it will detect your existing installation and offer 
 curl -fsSL https://raw.githubusercontent.com/Cisien/meshcoretomqtt/main/install.sh | sudo bash
 ```
 
+Existing installations are detected from parsed, layered broker configuration,
+including community presets. Install and update reject linked configuration
+roots or `config.d` directories before writing files. Custom install/config
+paths must be absolute and must not resolve to the filesystem root.
+Adding a custom broker chooses an unused `custom-N` name across the active
+configuration files.
+Owner and IATA edits preserve unrelated table values through parsed TOML.
+These edits normalize formatting and remove comments.
+
 For non-interactive updates:
 
 ```bash
@@ -696,7 +720,12 @@ The uninstaller will:
 
 For custom paths, set absolute `MCTOMQTT_INSTALL_DIR` and
 `MCTOMQTT_CONFIG_DIR` values when invoking the uninstaller. It shows the user
-configuration path without printing credentials.
+configuration path without printing credentials. Application paths must
+contain an installed `mctomqtt.py`, and neither path may resolve to the
+filesystem root. Configuration backups use unique filenames with owner-only
+permissions; a failed backup stops removal. Prompts use the controlling
+terminal when the script is piped, and end-of-input cancels pending actions.
+Docker detection matches the exact `mctomqtt` container name.
 
 ## Privacy
 

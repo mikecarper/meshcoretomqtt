@@ -151,26 +151,35 @@ class RealSerialConnection(SerialConnection):
             # legacy firmware prefixes the same value with an arrow.
             # Keep that framing before stripping whitespace: a legitimate
             # name such as DEBUGNode or BLE: relay is not an unsolicited log.
-            getter_reply = bool(
+            getter_active = bool(
                 self._active_command is not None
                 and self._active_command.lower().startswith("get ")
                 and not self._response_done
-                and (line.startswith("  >") or stripped.startswith("-> >"))
+            )
+            getter_reply = getter_active and (
+                line.startswith("  >") or stripped.startswith("-> >")
             )
             # An unframed terminal prompt may prefix the next unsolicited log
-            # or the next command echo. Do not strip '> value' getter replies.
+            # or command echo/framed reply. Do not strip '> value' getters.
             if not getter_reply and stripped.startswith("> "):
                 tail = stripped[2:].lstrip()
-                if tail == self._active_command or self._is_log_record(tail):
+                prefixed_getter = getter_active and stripped[2:].startswith("  >")
+                prefixed_reply = prefixed_getter or tail.startswith("-> ")
+                if (tail == self._active_command or self._is_log_record(tail)
+                        or prefixed_reply):
                     # Full Companion's final prompt has no newline. A log
                     # emitted immediately afterward shares the prompt's line,
                     # so finish the existing reply before queuing that log.
                     # A prompt preceding the command echo or its first reply
                     # must not finish a transaction that has no reply yet.
                     if (self._active_command is not None
-                            and self._response_lines and not self._response_done):
+                            and self._response_lines and not self._response_done
+                            and not prefixed_reply):
                         self._response_done = True
                         self._condition.notify_all()
+                    getter_reply = prefixed_getter or (
+                        getter_active and tail.startswith("-> >")
+                    )
                     stripped = tail
             if not getter_reply and self._is_log_record(stripped):
                 self._queue_line_locked(stripped)

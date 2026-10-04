@@ -295,12 +295,14 @@ class PahoBrokerClient(BrokerClient):
             return None
         try:
             result = self._client.publish(topic, payload, qos=qos, retain=retain)
-        except (ValueError, TypeError):
+        except ValueError:
             self._pending.finish(reservation, False)
             raise
         except Exception:
             # Do not under-account a transport failure after Paho might have
-            # enqueued the data. An opaque reservation expires normally.
+            # enqueued the data. TypeError can also occur after a QoS message
+            # is queued (for example, while composing invalid packet flags).
+            # An opaque reservation expires normally.
             self._pending.finish(reservation, False, may_be_queued=True)
             raise
         accepted = result.rc == mqtt.MQTT_ERR_SUCCESS

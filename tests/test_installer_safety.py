@@ -18,7 +18,7 @@ import tomllib
 import pytest
 
 from installer import InstallerContext
-from installer.config import _replace_owner_fields, _toml_dumps, toml_escape, write_private_config
+from installer.config import _config_dir_has_broker, _replace_owner_fields, _toml_dumps, toml_escape, write_private_config
 from installer.install_cmd import load_config_url
 from installer.migrate_cmd import prepare_migrated_config, run_migrate
 from installer.system import (
@@ -29,6 +29,163 @@ from installer.system import (
 )
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("placement, content, expected", [
+    ("config.d/10-preset.toml", '[[ broker ]]\nname="community"\nserver="mqtt.invalid"\n', True),
+    ("config.d/99-user.toml", '# example: [[broker]]\n[general]\niata="SEA"\n', False),
+    ("config.toml", '[[broker]]\nname="base"\nserver="mqtt.invalid"\n', True),
+])
+def test_installer_broker_detection_parses_base_and_drop_in_settings(tmp_path, placement, content, expected):
+    path = tmp_path / placement
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    assert _config_dir_has_broker(str(tmp_path)) is expected
+
+
+@pytest.mark.parametrize("broker_file, user_override", [
+    ("config.d/10-preset.toml", True),
+    ("config.d/10-preset.toml", False),
+    ("config.toml", False),
+])
+def test_broker_configured_existing_install_dispatches_update_before_service_account_work(
+        tmp_path, broker_file, user_override):
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "mctomqtt.py").write_text("# installed application\n")
+    config = tmp_path / "config"
+    (config / "config.d").mkdir(parents=True)
+    if user_override:
+        (config / "config.d/99-user.toml").write_text('[general]\niata="SEA"\n')
+    (config / broker_file).write_text('[[ broker ]]\nname="community"\nserver="mqtt.invalid"\n')
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    (selected / "mctomqtt.py").write_text('__version__ = "1.2.3"\n')
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    home = tmp_path / "empty-home"
+    home.mkdir()
+    environment = dict(os.environ, HOME=str(home))
+    environment.pop("SUDO_USER", None)
+    # Trace dispatch before external work, preserving all production detection
+    # and file reads; neither update nor service-account mutations are invoked.
+    script = '''
+import sys
+from installer import InstallerContext
+from installer.install_cmd import _do_install
+from installer.system import prompt_service_user
+from installer.update_cmd import run_update
+class UpdateDispatched(Exception): pass
+def trace(frame, event, arg):
+    if event == "call" and frame.f_code is run_update.__code__:
+        raise UpdateDispatched
+    if event == "call" and frame.f_code is prompt_service_user.__code__:
+        raise AssertionError("preset-only install incorrectly started a fresh installation")
+    return trace
+ctx=InstallerContext(install_dir=sys.argv[1], config_dir=sys.argv[2],
+                     local_install=sys.argv[3], update_mode=True)
+sys.settrace(trace)
+try:
+    _do_install(ctx, sys.argv[4])
+except UpdateDispatched:
+    sys.settrace(None)
+    print("UPDATE_DISPATCHED")
+else:
+    raise AssertionError("existing installation was not dispatched to update")
+'''
+    result = subprocess.run([sys.executable, "-c", script, str(app), str(config),
+                             str(selected), str(staging)], env=environment,
+                            capture_output=True, text=True, cwd=ROOT,
+                            start_new_session=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert "UPDATE_DISPATCHED" in result.stdout
+
+
+@pytest.mark.parametrize("operation", ["install", "update"])
+def test_preset_only_install_and_update_do_not_trigger_broker_setup(tmp_path, operation):
+    app = tmp_path / "app"
+    app.mkdir()
+    if operation == "update":
+        (app / "mctomqtt.py").write_text("# installed application\n")
+        (app / ".install_type").write_text("docker\n")
+    config = tmp_path / "config"
+    (config / "config.d").mkdir(parents=True)
+    preset = config / "config.d/10-community.toml"
+    preset_content = '[[ broker ]]\nname="community"\nserver="mqtt.invalid"\n'
+    preset.write_text(preset_content)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    home = tmp_path / "empty-home"
+    home.mkdir()
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    for command in ("getent", "id", "usermod"):
+        executable = binaries / command
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+    environment = dict(os.environ, HOME=str(home), PATH=f"{binaries}{os.pathsep}{os.environ['PATH']}")
+    environment.pop("SUDO_USER", None)
+    # Run actual file staging and TOML configuration, stopping before version
+    # fetching or service work. A fresh broker setup is a regression here.
+    script = '''
+import sys
+from installer import InstallerContext
+from installer.config import configure_mqtt_brokers
+from installer.system import create_version_info, set_permissions, run_cmd
+from installer.install_cmd import _do_install
+from installer.update_cmd import _do_update
+class ConfigurationKept(Exception): pass
+def trace(frame, event, arg):
+    if event == "call" and frame.f_code is configure_mqtt_brokers.__code__:
+        raise AssertionError("preset-only flow incorrectly requested broker setup")
+    if event == "call" and frame.f_code in (create_version_info.__code__, set_permissions.__code__):
+        raise ConfigurationKept
+    if event == "call" and frame.f_code is run_cmd.__code__:
+        assert frame.f_locals['cmd'][0] in ('getent', 'id', 'usermod', 'python3')
+    return trace
+ctx = InstallerContext(install_dir=sys.argv[1], config_dir=sys.argv[2],
+                       local_install=sys.argv[3], svc_user="", update_mode=True)
+sys.settrace(trace)
+try:
+    operation = _do_install if sys.argv[5] == "install" else _do_update
+    operation(ctx, sys.argv[4])
+except ConfigurationKept:
+    sys.settrace(None)
+    print("CONFIGURATION_KEPT")
+else:
+    raise AssertionError("configuration verification checkpoint was not reached")
+'''
+    result = subprocess.run([sys.executable, "-c", script, str(app), str(config),
+                             str(ROOT), str(staging), operation], cwd=ROOT,
+                            env=environment, input="testsvc\n2\n", capture_output=True,
+                            text=True, start_new_session=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert "CONFIGURATION_KEPT" in result.stdout
+    assert preset.read_text() == preset_content
+    assert not (config / "config.d/99-user.toml").exists()
+
+
+@pytest.mark.parametrize("docker_present", [False, True])
+def test_markerless_install_detection_accepts_missing_optional_service_tools(tmp_path, docker_present):
+    if pathlib.Path("/etc/systemd/system/mctomqtt.service").exists():
+        pytest.skip("a real systemd unit determines the installation type")
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    if docker_present:
+        docker = binaries / "docker"
+        docker.write_text("#!/bin/sh\nexit 1\n")
+        docker.chmod(0o755)
+    app = tmp_path / "app"
+    app.mkdir()
+    script = (
+        "import platform, sys\nfrom installer.system import detect_system_type\n"
+        "expected='launchd' if platform.system() == 'Darwin' else 'unknown'\n"
+        "assert detect_system_type(sys.argv[1]) == expected\n"
+    )
+    result = subprocess.run([sys.executable, "-c", script, str(app)],
+                            env=dict(os.environ, PATH=str(binaries)), cwd=ROOT,
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
 
 
 def test_recursive_ownership_accepts_dangling_symlinks_without_following_them(tmp_path):

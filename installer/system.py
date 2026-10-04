@@ -298,6 +298,22 @@ def chown_recursive(path: str, user: str, group: str) -> None:
 # File download
 # ---------------------------------------------------------------------------
 
+def install_bridge_package(repo_dir: str, install_dir: str, staging_dir: str) -> None:
+    """Snapshot the source package before retiring a possibly identical target."""
+    source = Path(repo_dir) / "bridge"
+    if not source.is_dir():
+        return
+    snapshot = Path(tempfile.mkdtemp(prefix=".bridge-source-", dir=staging_dir))
+    try:
+        shutil.copytree(source, snapshot, dirs_exist_ok=True)
+        destination = Path(install_dir) / "bridge"
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.copytree(snapshot, destination)
+    finally:
+        shutil.rmtree(snapshot, ignore_errors=True)
+
+
 def download_file(url: str, dest: str, name: str) -> None:
     """Download a file with curl and retry."""
     print_info(f"Downloading {name}...")
@@ -480,10 +496,10 @@ def create_system_user(svc_user: str, install_dir: str) -> None:
 
 def set_permissions(install_dir: str, config_dir: str, svc_user: str) -> None:
     """Set directory ownership and permissions."""
-    config_root = Path(config_dir)
-    config_d = config_root / "config.d"
-    if config_root.is_symlink() or config_d.is_symlink():
-        raise ValueError("Configuration directories must not be symlinks")
+    from .config import validate_config_directory, validate_install_directory
+    validate_install_directory(install_dir)
+    validate_config_directory(config_dir)
+    config_d = Path(config_dir) / "config.d"
     # /opt/mctomqtt owned by svc_user:svc_user
     chown_recursive(install_dir, svc_user, svc_user)
     print_success(f"{install_dir} owned by {svc_user}:{svc_user}")
@@ -515,10 +531,31 @@ LOCAL_IMAGE = "mctomqtt:latest"
 
 def docker_cmd() -> str | None:
     """Return 'docker' if the daemon is reachable, or None."""
+    if shutil.which("docker") is None:
+        return None
     result = run_cmd(["docker", "info"], check=False, capture=True)
     if result.returncode == 0:
         return "docker"
     return None
+
+
+def docker_container_exists() -> bool:
+    """Check the exact deployment container rather than listing substrings."""
+    result = run_cmd(
+        ["docker", "inspect", "--type", "container", "--format", "{{.Name}}", "mctomqtt"],
+        check=False, capture=True,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "/mctomqtt"
+
+
+def docker_container_running() -> bool:
+    """Read the exact deployment container's name and running state."""
+    result = run_cmd(
+        ["docker", "inspect", "--type", "container", "--format",
+         "{{.Name}} {{.State.Running}}", "mctomqtt"],
+        check=False, capture=True,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "/mctomqtt true"
 
 
 def pull_or_build_docker_image(ctx: InstallerContext) -> str | None:
@@ -708,29 +745,26 @@ def detect_system_type(install_dir: str) -> str:
 
     # Fallback: detect from running services
     docker = docker_cmd()
-    if docker:
-        result = run_cmd(
-            ["docker", "ps", "-a"],
-            check=False, capture=True,
-        )
-        if result.returncode == 0 and "mctomqtt" in result.stdout:
-            return "docker"
+    if docker and docker_container_exists():
+        return "docker"
 
     # systemd
-    result = run_cmd(
-        ["systemctl", "is-active", "--quiet", "mctomqtt.service"],
-        check=False,
-    )
-    if result.returncode == 0:
-        return "systemd"
+    if shutil.which("systemctl") is not None:
+        result = run_cmd(
+            ["systemctl", "is-active", "--quiet", "mctomqtt.service"],
+            check=False,
+        )
+        if result.returncode == 0:
+            return "systemd"
     if Path("/etc/systemd/system/mctomqtt.service").exists():
         return "systemd"
 
     # launchd
     if platform.system() == "Darwin":
-        result = run_cmd(["launchctl", "list"], check=False, capture=True)
-        if result.returncode == 0 and "com.meshcore.mctomqtt" in result.stdout:
-            return "launchd"
+        if shutil.which("launchctl") is not None:
+            result = run_cmd(["launchctl", "list"], check=False, capture=True)
+            if result.returncode == 0 and "com.meshcore.mctomqtt" in result.stdout:
+                return "launchd"
         if Path("/Library/LaunchDaemons/com.meshcore.mctomqtt.plist").exists():
             return "launchd"
 
@@ -764,8 +798,7 @@ def check_service_health(service_type: str) -> None:
 
     if service_type == "docker":
         result = run_cmd(["docker", "logs", "mctomqtt"], check=False, capture=True)
-        ps_result = run_cmd(["docker", "ps"], check=False, capture=True)
-        if ps_result.returncode == 0 and "mctomqtt" in ps_result.stdout:
+        if docker_container_running():
             if "connected to" in result.stdout.lower() or "connected to" in result.stderr.lower():
                 print_success("Container started and connected successfully")
             else:
@@ -990,8 +1023,7 @@ def install_docker_service(ctx: InstallerContext) -> bool:
 
     if prompt_yes_no("Start Docker container now?", "y"):
         # Remove existing container if present
-        ps_result = run_cmd(["docker", "ps", "-a"], check=False, capture=True)
-        if ps_result.returncode == 0 and "mctomqtt" in ps_result.stdout:
+        if docker_container_exists():
             print_info("Removing existing mctomqtt container...")
             run_cmd(["docker", "rm", "-f", "mctomqtt"], check=False)
 

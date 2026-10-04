@@ -62,7 +62,7 @@ def test_docker_default_candidate_is_used_without_explicit_ports(tmp_path, capsy
         assert str(default) in capsys.readouterr().out
 
 
-def _fake_docker_environment(tmp_path):
+def _fake_docker_environment(tmp_path, container_present=True):
     binaries = tmp_path / "bin"
     binaries.mkdir()
     calls = tmp_path / "docker-calls.jsonl"
@@ -73,13 +73,45 @@ def _fake_docker_environment(tmp_path):
         "from pathlib import Path\n"
         "with Path(os.environ['TEST_DOCKER_CALLS']).open('a') as output:\n"
         "    output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-        "if sys.argv[1:2] == ['ps']: print('mctomqtt')\n"
+        "if sys.argv[1:2] == ['ps']:\n"
+        "    print('mctomqtt' if os.environ.get('TEST_CONTAINER_PRESENT') == '1' else 'mctomqtt-old')\n"
+        "if sys.argv[1:2] == ['inspect']:\n"
+        "    if os.environ.get('TEST_CONTAINER_PRESENT') != '1': sys.exit(1)\n"
+        "    print('/mctomqtt true' if '{{.State.Running}}' in ' '.join(sys.argv) else '/mctomqtt')\n"
         "if sys.argv[1:2] == ['logs']: print('connected to mqtt.invalid')\n"
         "if sys.argv[1:2] == ['--version']: print('Docker test CLI')\n"
     )
     docker.chmod(0o755)
     return dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ["PATH"],
-                TEST_DOCKER_CALLS=str(calls)), calls
+                TEST_DOCKER_CALLS=str(calls), TEST_CONTAINER_PRESENT=str(int(container_present))), calls
+
+
+def test_markerless_detection_ignores_unrelated_docker_container_substrings(tmp_path):
+    if Path("/etc/systemd/system/mctomqtt.service").exists():
+        pytest.skip("a real systemd unit determines the installation type")
+    environment, calls = _fake_docker_environment(tmp_path, container_present=False)
+    environment["PATH"] = str(tmp_path / "bin")
+    app = tmp_path / "app"
+    app.mkdir()
+    result = subprocess.run([
+        sys.executable, "-c", "import platform, sys; "
+        "from installer.system import detect_system_type; "
+        "expected = 'launchd' if platform.system() == 'Darwin' else 'unknown'; "
+        "assert detect_system_type(sys.argv[1]) == expected", str(app),
+    ], env=environment, cwd=ROOT, capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert not any(json.loads(line)[0] == "ps" for line in calls.read_text().splitlines())
+
+
+def test_docker_health_ignores_unrelated_running_container_substrings(tmp_path):
+    environment, calls = _fake_docker_environment(tmp_path, container_present=False)
+    result = subprocess.run([
+        sys.executable, "-c", "from installer.system import check_service_health; "
+        "check_service_health('docker')",
+    ], env=environment, cwd=ROOT, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert "Container started" not in result.stdout
+    assert not any(json.loads(line)[0] == "ps" for line in calls.read_text().splitlines())
 
 
 @pytest.mark.parametrize("operation", ["install", "update"])

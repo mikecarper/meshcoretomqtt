@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import base64
 import math
+import os
 import time
 import sys
 from typing import Any
@@ -213,8 +214,11 @@ if __name__ == "__main__":
 
     public_key = sys.argv[1]
     private_key_input = sys.argv[2]
+    private_key_hex = ''.join(private_key_input.split())
 
-    if len(private_key_input) < 128:
+    # Existing files take precedence regardless of path length. Normalize an
+    # inline key exactly as the file reader does, including split hex digits.
+    if os.path.isfile(private_key_input) or len(private_key_hex) < 128:
         try:
             private_key = read_private_key_file(private_key_input)
             print(f"Loaded private key from: {private_key_input}")
@@ -222,7 +226,7 @@ if __name__ == "__main__":
             print(f"Error: {e}")
             sys.exit(1)
     else:
-        private_key = private_key_input
+        private_key = private_key_hex
 
     try:
         token = create_auth_token(public_key, private_key)

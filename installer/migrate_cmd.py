@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .system import run_cmd
-from .config import toml_escape, write_private_config
+from .config import toml_escape, write_private_config, validate_config_directory, validate_install_directory
 from .ui import (
     print_header,
     print_info,
@@ -215,6 +215,7 @@ def mark_migrated(old_dir: str, install_dir: str) -> None:
 
 def prepare_migrated_config(merged: dict[str, str], config_dir: str) -> Path | None:
     """Commit validated private config before any legacy service is retired."""
+    validate_config_directory(config_dir)
     dest = Path(config_dir) / "config.d" / "99-user.toml"
     legacy = dest.with_name("00-user.toml")
     if dest.exists() or dest.is_symlink() or legacy.exists() or legacy.is_symlink():
@@ -237,6 +238,8 @@ def run_migrate(ctx: InstallerContext) -> bool:
 
     Returns True if migration was performed, False if skipped/nothing to migrate.
     """
+    validate_install_directory(ctx.install_dir)
+    validate_config_directory(ctx.config_dir)
     old_dir = detect_old_installation()
     if old_dir is None:
         return False

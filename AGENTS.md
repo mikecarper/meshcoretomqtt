@@ -113,15 +113,21 @@ See `config.toml.example` for the full reference with all options and defaults.
 - **Thread safety:** Serial port access is protected by internal locking in `RealSerialConnection`. The main loop, stats thread, and remote serial handler all call methods on the `SerialConnection` ABC — the lock is never exposed to callers.
 - **Bounded capture:** Only the serial reader reads bytes. Commands must not purge RX buffers or consume packet records. Default line/queue bounds are 4096 bytes/256 records; whole-record drops report `DROP:<count>`. Writes and command-lock/reply waits have finite deadlines. A timed-out command closes the session to quarantine late replies.
   Preserve getter framing (`  >value` and `  -> >value`) before log
-  classification; split the reply prefix only once. Private keys require
+  classification, including replies following a leftover terminal prompt;
+  split the reply prefix only once. Debug text may quote packet records and
+  must not change the cached RAW pair. Private keys require
   exactly 128 hexadecimal digits after whitespace removal.
 - **Bounded MQTT:** `PahoBrokerClient` reserves message/byte credits before publishing, including QoS 0. Public `MQTTMessageInfo` receipts reconcile callback-before-return races and MID reuse. Never assume Paho's queue limit covers QoS 0. Manager owns reconnects; Paho automatic reconnect is disabled. Remove no-op/manual WebSocket keepalive workers rather than reintroducing a shared stop flag.
+  Publish exceptions may occur after Paho queues data; retain uncertain credits
+  until completion or transport retirement rather than releasing them blindly.
 - **Lifecycle/health:** Start/stop broker work through the manager supervisor, not the USB main loop. Retain retry counts across successful transport setup and reject stale-generation callbacks. Watchdog notifications require progress from both the main loop and supervisor; idle meshes remain healthy. DNS is not guaranteed cancellable. Keep systemd, Docker installer/updater, NixOS, tests and deployment docs aligned when changing resource defaults.
   Retire failed/unconfirmed transports before reconnect backoff and preserve
   their offline LWT; only confirmed final status permits graceful retirement.
 - **MQTT auth:** Two modes per broker — username/password or JWT auth tokens (generated from device's Ed25519 private key). Tokens are cached with TTL. Auth operations go through the `AuthProvider` ABC.
   Validate 32-byte public keys and 64-byte signatures before calling the native
   verifier. Present expiry claims must be finite numbers and expire at `exp`.
+  The token CLI accepts existing key files regardless of path length and
+  normalizes whitespace in inline hexadecimal keys.
 - **Graceful shutdown:** SIGTERM/SIGINT handlers set `state.should_exit = True`. The main loop checks this flag each iteration.
   The supervisor holds transports until explicit stop. Confirm final offline
   using the broker retain policy and a shared five-second budget; abort
@@ -132,6 +138,8 @@ See `config.toml.example` for the full reference with all options and defaults.
   graceful DISCONNECT window before forced retirement.
   Wake idle statistics workers through the shutdown event before joining;
   signal handlers continue to set only the exit flag.
+  Device counter decreases indicate resets; a decreasing uptime invalidates
+  the entire previous device baseline. Never report negative counter deltas.
 - **Remote serial:** Require finite expiry, bounded single-line commands and
   native verified claims. Protect nonce pruning/check/reservation with one
   lock; retain until max(minimum TTL, JWT expiry), rejecting new commands when
@@ -142,6 +150,13 @@ See `config.toml.example` for the full reference with all options and defaults.
   during shutdown. Reject malformed remote configuration before starting work.
 - **Installer safety:** Validate TOML before atomic private writes; config
   directories/files use 750/640 and Docker gets the host numeric config group.
+  Directory selectors must be absolute and must not resolve to filesystem root.
+  Detect brokers from parsed base/drop-in TOML and allocate unused custom
+  broker names, so named overlays cannot replace an existing broker by accident.
+  Owner and IATA edits operate on parsed tables and preserve unrelated values,
+  including TOML date/time scalars; serialization normalizes formatting/comments.
+  Stage the bridge package before retiring its destination; `LOCAL_INSTALL`
+  may refer to the installation directory itself or an alias of it.
   Parse layered serial TOML for Docker mappings and include all present
   candidates; validate configuration before removing an existing container.
   Preserve bootstrap argv and explicitly supported environment selectors
@@ -150,9 +165,15 @@ See `config.toml.example` for the full reference with all options and defaults.
   mandatory device units or writable-path mounts.
   Ownership changes must operate on symlinks themselves, without following
   their targets; config mode changes must not affect linked external files.
+  Reject linked config roots/drop-in directories before installation or update
+  writes, rather than waiting for the final permission pass.
   Migration preserves effective legacy defaults plus local overrides, since
   new TOML defaults may differ. Uninstallation honors absolute path selectors
-  and must not print credential-bearing configuration.
+  and must not print credential-bearing configuration. Reject filesystem-root
+  selectors and application directories without an installed entry point.
+  Backups use unique mode-600 files; backup failure stops configuration
+  removal. Read uninstaller prompts from the controlling terminal when piped,
+  decline actions on EOF, and match exact Docker container/image names.
 - **Config access:** `state.config` dict with `state.config.get('section', {}).get('key', default)`. Broker configs accessed via `topics.get_broker_config(state, broker_idx)`.
 - **Version:** `__version__` is defined at the top of `mctomqtt.py`. The `.version_info` JSON file (created by installer) appends git hash info. Version is passed to `MeshCoreBridge(config, debug, version)`.
 - **Dependency injection:** All external dependencies (serial, MQTT, auth) are abstracted behind ABCs. Tests inject fakes via `make_test_state()` from `tests/fakes.py`.

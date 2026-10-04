@@ -359,3 +359,26 @@ class TestPahoBoundedPublishing:
             assert client.publish('test', 'ok')
         finally:
             close_client(client, receiver)
+
+    @pytest.mark.parametrize('options', [
+        {'qos': 2.0},
+        {'qos': 2, 'retain': 1.0},
+    ])
+    def test_type_error_after_paho_enqueue_keeps_byte_credit(self, options):
+        receiver = LocalMqttReceiver()
+        client = connect_client(receiver, max_pending_messages=2,
+                                max_pending_bytes=50, publish_timeout=0.02)
+        try:
+            # Paho accepts these values far enough to queue QoS data, then
+            # raises while composing packet flags. They have no public receipt.
+            with pytest.raises(TypeError):
+                client.publish('test', 'payload', **options)
+            assert client.pending_messages == 1
+            assert client.pending_bytes == 4 + 7 + 32
+            assert client.publish_stats['errors'] == 1
+            assert not client.publish('test', 'payload', qos=2)
+            assert receiver.packets == 0
+            time.sleep(0.03)
+            assert client.publish_stalled
+        finally:
+            close_client(client, receiver)

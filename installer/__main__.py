@@ -6,6 +6,7 @@ import os
 import sys
 
 from . import InstallerContext
+from .config import validate_config_directory, validate_install_directory
 from .system import require_root
 
 
@@ -33,10 +34,18 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    for selector in ("MCTOMQTT_INSTALL_DIR", "MCTOMQTT_CONFIG_DIR"):
+    for selector, validate_directory in (
+        ("MCTOMQTT_INSTALL_DIR", validate_install_directory),
+        ("MCTOMQTT_CONFIG_DIR", validate_config_directory),
+    ):
         selected_dir = os.environ.get(selector)
         if selected_dir and not os.path.isabs(selected_dir):
             parser.error(f"{selector} must be an absolute path")
+        if selected_dir:
+            try:
+                validate_directory(selected_dir)
+            except (OSError, ValueError) as error:
+                parser.error(f"{selector}: {error}")
 
     require_root()
 

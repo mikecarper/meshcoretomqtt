@@ -12,12 +12,17 @@ from typing import TYPE_CHECKING
 
 from . import extract_version_from_file
 from .config import (
+    _config_dir_has_broker,
     configure_mqtt_brokers,
+    has_token_auth_brokers,
+    token_auth_owner_defaults,
     update_owner_info,
     migrate_user_config_filename,
     token_preset_brokers,
     user_config_path,
     write_private_config,
+    validate_config_directory,
+    validate_install_directory,
 )
 from .system import (
     LOCAL_IMAGE,
@@ -28,11 +33,13 @@ from .system import (
     create_venv,
     detect_service_user,
     detect_system_type,
+    docker_container_exists,
     docker_run_command,
     docker_serial_device_args,
     download_repo_archive,
     install_systemd_service,
     install_launchd_service,
+    install_bridge_package,
     pull_or_build_docker_image,
     run_cmd,
     set_permissions,
@@ -51,6 +58,8 @@ if TYPE_CHECKING:
 
 def run_update(ctx: InstallerContext) -> None:
     """Update an existing installation."""
+    validate_install_directory(ctx.install_dir)
+    validate_config_directory(ctx.config_dir)
 
     # Verify installation exists
     if not Path(ctx.install_dir, "mctomqtt.py").exists():
@@ -67,6 +76,8 @@ def run_update(ctx: InstallerContext) -> None:
 
 
 def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
+    validate_install_directory(ctx.install_dir)
+    validate_config_directory(ctx.config_dir)
     # Download repo archive (or use local install path)
     if ctx.local_install:
         repo_dir = ctx.local_install
@@ -127,12 +138,7 @@ def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
     shutil.copy2(os.path.join(tmp_dir, "auth_token.py"), f"{ctx.install_dir}/")
     shutil.copy2(os.path.join(tmp_dir, "config_loader.py"), f"{ctx.install_dir}/")
     # Copy bridge package
-    bridge_src = os.path.join(repo_dir, "bridge")
-    bridge_dest = os.path.join(ctx.install_dir, "bridge")
-    if os.path.isdir(bridge_src):
-        if os.path.exists(bridge_dest):
-            shutil.rmtree(bridge_dest)
-        shutil.copytree(bridge_src, bridge_dest)
+    install_bridge_package(repo_dir, ctx.install_dir, tmp_dir)
     shutil.copy2(os.path.join(tmp_dir, "uninstall.sh"), f"{ctx.install_dir}/")
     for f in ("mctomqtt.service", "com.meshcore.mctomqtt.plist"):
         src = os.path.join(tmp_dir, f)
@@ -175,16 +181,15 @@ def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
 
             # Offer owner info update for token-auth brokers
             content = user_toml.read_text()
-            if 'method = "token"' in content or token_preset_brokers(ctx.config_dir):
+            if has_token_auth_brokers(content) or token_preset_brokers(ctx.config_dir):
                 print()
                 print_info("Token-authenticated brokers detected")
 
-                owner_match = re.search(r'owner\s*=\s*"([^"]*)"', content)
-                email_match = re.search(r'email\s*=\s*"([^"]*)"', content)
-                if owner_match and owner_match.group(1):
-                    print_info(f"Current owner: {owner_match.group(1)}")
-                if email_match and email_match.group(1):
-                    print_info(f"Current email: {email_match.group(1)}")
+                owner, email = token_auth_owner_defaults(content)
+                if owner:
+                    print_info(f"Current owner: {owner}")
+                if email:
+                    print_info(f"Current email: {email}")
 
                 # Show remote serial config
                 rs_match = re.search(r'\[remote_serial\]\s*\n\s*enabled\s*=\s*(\w+)', content)
@@ -194,6 +199,8 @@ def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
 
                 if prompt_yes_no("Update owner information or remote serial configuration?", "n"):
                     update_owner_info(ctx.config_dir)
+    elif _config_dir_has_broker(ctx.config_dir):
+        print_info("Keeping existing broker configuration")
     else:
         configure_mqtt_brokers(ctx)
 
@@ -249,8 +256,7 @@ def _restart_docker_container(config_dir: str, image: str) -> None:
     """Prepare mappings before replacing an existing Docker container."""
     parts = docker_run_command(config_dir, image)
     parts[-1:-1] = docker_serial_device_args(config_dir)
-    ps_result = run_cmd(["docker", "ps", "-a"], check=False, capture=True)
-    if ps_result.returncode == 0 and "mctomqtt" in ps_result.stdout:
+    if docker_container_exists():
         print_info("Restarting container...")
         run_cmd(["docker", "stop", "mctomqtt"], check=False)
         run_cmd(["docker", "rm", "mctomqtt"], check=False)

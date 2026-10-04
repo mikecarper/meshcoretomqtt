@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from . import extract_version_from_file
 from .config import (
+    _config_dir_has_broker,
     configure_mqtt_brokers,
     _read_existing_iata,
     prompt_iata_letsmesh,
@@ -22,6 +23,8 @@ from .config import (
     user_config_path,
     write_private_config,
     _toml_dumps,
+    validate_config_directory,
+    validate_install_directory,
 )
 from .migrate_cmd import run_migrate
 from .system import (
@@ -34,6 +37,7 @@ from .system import (
     install_docker_service,
     install_launchd_service,
     install_systemd_service,
+    install_bridge_package,
     manual_run_command,
     prompt_service_user,
     run_cmd,
@@ -63,6 +67,8 @@ def run_install(ctx: InstallerContext) -> None:
 
 
 def _do_install(ctx: InstallerContext, tmp_dir: str) -> None:
+    validate_install_directory(ctx.install_dir)
+    validate_config_directory(ctx.config_dir)
     # Download repo archive (or use local install path)
     if ctx.local_install:
         repo_dir = ctx.local_install
@@ -103,8 +109,7 @@ def _do_install(ctx: InstallerContext, tmp_dir: str) -> None:
     user_toml = migrate_user_config_filename(ctx.config_dir)
     has_existing = (
         Path(ctx.install_dir, "mctomqtt.py").exists()
-        and user_toml.exists()
-        and "[[broker]]" in (user_toml.read_text() if user_toml.exists() else "")
+        and _config_dir_has_broker(ctx.config_dir)
     )
 
     if has_existing:
@@ -208,12 +213,7 @@ def _do_install(ctx: InstallerContext, tmp_dir: str) -> None:
     shutil.copy2(os.path.join(tmp_dir, "auth_token.py"), f"{ctx.install_dir}/")
     shutil.copy2(os.path.join(tmp_dir, "config_loader.py"), f"{ctx.install_dir}/")
     # Copy bridge package
-    bridge_src = os.path.join(repo_dir, "bridge")
-    bridge_dest = os.path.join(ctx.install_dir, "bridge")
-    if os.path.isdir(bridge_src):
-        if os.path.exists(bridge_dest):
-            shutil.rmtree(bridge_dest)
-        shutil.copytree(bridge_src, bridge_dest)
+    install_bridge_package(repo_dir, ctx.install_dir, tmp_dir)
     shutil.copy2(os.path.join(tmp_dir, "uninstall.sh"), f"{ctx.install_dir}/")
     for f in ("mctomqtt.service", "com.meshcore.mctomqtt.plist"):
         src = os.path.join(tmp_dir, f)
@@ -237,13 +237,12 @@ def _do_install(ctx: InstallerContext, tmp_dir: str) -> None:
         _handle_config_url(ctx, user_toml)
     elif migration_done and user_toml.exists():
         print_success("Using migrated configuration")
-        if "[[broker]]" not in user_toml.read_text():
+        if not _config_dir_has_broker(ctx.config_dir):
             print_warning("No MQTT brokers found in migrated config")
             configure_mqtt_brokers(ctx)
-    elif not user_toml.exists():
-        configure_mqtt_brokers(ctx)
-    elif "[[broker]]" not in user_toml.read_text():
-        print_warning("Incomplete configuration detected - MQTT brokers not configured")
+    elif not _config_dir_has_broker(ctx.config_dir):
+        if user_toml.exists():
+            print_warning("Incomplete configuration detected - MQTT brokers not configured")
         configure_mqtt_brokers(ctx)
 
     # ---------------------------------------------------------------------------
@@ -403,7 +402,7 @@ def _handle_config_url(ctx: InstallerContext, user_toml: Path) -> None:
 
         print_success(f"IATA code set to: {iata}")
 
-        if "[[broker]]" in content:
+        if _config_dir_has_broker(ctx.config_dir):
             print_success("MQTT brokers already configured in downloaded config")
             if prompt_yes_no("Would you like to add broker presets or custom brokers?", "n"):
                 configure_mqtt_brokers(ctx)

@@ -15,11 +15,11 @@ from auth_token import (
     read_private_key_file,
     verify_auth_token,
 )
-from tests.test_auth_token import TestAuthToken
+from tests import test_auth_token as token_fixtures
 
 
-PUBLIC_KEY = TestAuthToken.public_key
-PRIVATE_KEY = TestAuthToken.private_key
+PUBLIC_KEY = token_fixtures.TestAuthToken.public_key
+PRIVATE_KEY = token_fixtures.TestAuthToken.private_key
 
 
 def sign_payload(payload):

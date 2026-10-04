@@ -35,13 +35,6 @@ def parse_and_publish(state: BridgeState, line: str) -> None:
     if not line:
         return
 
-    # Both firmware congestion and the bounded host reader can drop records.
-    # Never carry a RAW payload across an explicitly reported gap.
-    if re.search(r"(?:^|\s)DROP:\d+(?:\s|$)", line):
-        state.last_raw = None
-        state.last_raw_stamp = None
-        return
-
     logger.debug(f"From Radio: {line}")
 
     message: dict = {
@@ -49,6 +42,24 @@ def parse_and_publish(state: BridgeState, line: str) -> None:
         "origin_id": state.repeater_pub_key,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
+
+    # DEBUG text may quote RAW or DROP records. It is not packet framing,
+    # even when debug publishing is disabled.
+    if line.startswith("DEBUG"):
+        if state.debug:
+            message.update({
+                "type": "DEBUG",
+                "message": line
+            })
+            safe_publish(state, "debug", json.dumps(message))
+        return
+
+    # Both firmware congestion and the bounded host reader can drop records.
+    # Never carry a RAW payload across an explicitly reported gap.
+    if re.search(r"(?:^|\s)DROP:\d+(?:\s|$)", line):
+        state.last_raw = None
+        state.last_raw_stamp = None
+        return
 
     # Handle RAW messages
     if "U RAW:" in line:
@@ -65,16 +76,6 @@ def parse_and_publish(state: BridgeState, line: str) -> None:
                 state.last_raw_at = time.monotonic()
                 state.stats['bytes_processed'] += len(raw_hex) // 2
         return
-
-    # Handle DEBUG messages
-    if state.debug:
-        if line.startswith("DEBUG"):
-            message.update({
-                "type": "DEBUG",
-                "message": line
-            })
-            safe_publish(state, "debug", json.dumps(message))
-            return
 
     # Handle Packet messages (RX and TX)
     packet_match = PACKET_PATTERN.match(line)

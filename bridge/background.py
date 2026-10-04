@@ -139,6 +139,12 @@ def _publish_pressure_summary(state: BridgeState) -> str:
 def _log_device_stats(state: BridgeState, time_elapsed: float) -> None:
     """Format and log device statistics."""
     ds = state.stats['device']
+    prev = state.stats.get('device_prev') or {}
+    if ('uptime_secs' in ds and 'uptime_secs' in prev
+            and ds['uptime_secs'] < prev['uptime_secs']):
+        # A reboot resets the counter baseline even if a new counter has
+        # already grown beyond the previous sample's value.
+        prev = {}
     parts: list[str] = []
 
     if 'noise_floor' in ds:
@@ -150,10 +156,9 @@ def _log_device_stats(state: BridgeState, time_elapsed: float) -> None:
         rx_secs_total = ds['rx_air_secs']
         uptime_secs = ds['uptime_secs']
 
-        prev = state.stats.get('device_prev', {})
         if prev and 'tx_air_secs' in prev and 'rx_air_secs' in prev and 'uptime_secs' in prev:
-            tx_delta = tx_secs_total - prev['tx_air_secs']
-            rx_delta = rx_secs_total - prev['rx_air_secs']
+            tx_delta = _counter_delta(tx_secs_total, prev['tx_air_secs'])
+            rx_delta = _counter_delta(rx_secs_total, prev['rx_air_secs'])
             uptime_delta = uptime_secs - prev['uptime_secs']
 
             if uptime_delta > 0:
@@ -189,11 +194,15 @@ def _log_device_stats(state: BridgeState, time_elapsed: float) -> None:
         parts.append(f"Queue: {ds['queue_len']}")
 
     if 'recv_errors' in ds:
-        prev = state.stats.get('device_prev', {})
         prev_errors = prev.get('recv_errors', 0) if prev else 0
-        errors_delta = ds['recv_errors'] - prev_errors
+        errors_delta = _counter_delta(ds['recv_errors'], prev_errors)
         errors_per_min = (errors_delta / time_elapsed) * 60 if time_elapsed > 0 else 0
         parts.append(f"Err/min (5m): {errors_per_min:.1f}")
 
     if parts:
         logger.info(f"[DEVICE] {' | '.join(parts)}")
+
+
+def _counter_delta(current: float, previous: float) -> float:
+    """Count observations after a counter reset instead of subtracting them."""
+    return current - previous if current >= previous else current

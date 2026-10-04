@@ -93,6 +93,23 @@ class TestParseAndPublish:
         msg = json.loads(broker.published[0][1])
         assert msg['type'] == "DEBUG"
 
+    @pytest.mark.parametrize('debug_enabled', [False, True])
+    @pytest.mark.parametrize('quoted_text', ['U RAW: packet data', 'DROP:3'])
+    def test_debug_text_with_packet_marker_preserves_pair(self, debug_enabled, quoted_text):
+        state, broker = self._make_state()
+        state.debug = debug_enabled
+        parse_and_publish(state, '12:34:56 - 1/15/2025 U RAW: AABB0011')
+        line = f'DEBUG received {quoted_text}'
+        parse_and_publish(state, line)
+        parse_and_publish(state, '12:34:56 - 1/15/2025 U: RX, len=4 (type=1, route=D, payload_len=2)')
+        messages = [json.loads(payload) for _, payload, _, _ in broker.published]
+        if debug_enabled:
+            assert messages[0]['type'] == 'DEBUG'
+            assert messages[0]['message'] == line
+        assert messages[-1]['type'] == 'PACKET'
+        assert messages[-1]['raw'] == 'AABB0011'
+        assert len(messages) == 1 + int(debug_enabled)
+
     def test_ignores_junk(self):
         state, broker = self._make_state()
         parse_and_publish(state, "random garbage line")

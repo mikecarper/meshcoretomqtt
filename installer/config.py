@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import datetime as datetime_types
 import errno
 import os
 import re
@@ -36,6 +37,35 @@ LEGACY_USER_CONFIG_FILENAME = "00-user.toml"
 PRESET_PREFIX = "10-"
 
 
+def _validate_directory_paths(paths: tuple[Path, ...]) -> None:
+    for directory in paths:
+        if directory.resolve() == Path("/"):
+            raise ValueError("Configuration directory must not be the filesystem root")
+        if directory.is_symlink():
+            raise ValueError("Configuration directories must not be symlinks")
+        if directory.exists() and not directory.is_dir():
+            raise ValueError(f"Configuration path must be a directory: {directory}")
+
+
+def validate_config_directory(config_dir: str | Path) -> None:
+    """Reject linked config roots/drop-ins before any installer mutation.
+
+    Check the selected directories themselves; an alias in a parent such as
+    macOS's /etc -> /private/etc remains a supported path.
+    """
+    root = Path(config_dir)
+    _validate_directory_paths((root, root / "config.d"))
+
+
+def validate_install_directory(install_dir: str | Path) -> None:
+    """Keep installation writes and ownership traversal away from system root."""
+    root = Path(install_dir)
+    if root.resolve() == Path("/"):
+        raise ValueError("Installation directory must not be the filesystem root")
+    if (root.exists() or root.is_symlink()) and not root.is_dir():
+        raise ValueError(f"Installation path must be a directory: {root}")
+
+
 def user_config_path(config_dir: str | Path) -> Path:
     """Return the canonical user override path."""
     return Path(config_dir) / "config.d" / USER_CONFIG_FILENAME
@@ -48,6 +78,7 @@ def legacy_user_config_path(config_dir: str | Path) -> Path:
 
 def migrate_user_config_filename(config_dir: str | Path) -> Path:
     """Rename legacy 00-user.toml to 99-user.toml so user overrides load last."""
+    validate_config_directory(config_dir)
     new_path = user_config_path(config_dir)
     old_path = legacy_user_config_path(config_dir)
 
@@ -112,6 +143,12 @@ def write_private_config(path: str | Path, content: str, *, overwrite: bool = Tr
     """Validate and atomically install private TOML, preserving existing ownership."""
     tomllib.loads(content)
     dest = Path(path)
+    if dest.parent.name == "config.d":
+        # Drop-ins identify their configured root explicitly. Check both even
+        # for callers that use this writer outside installer orchestration.
+        validate_config_directory(dest.parent.parent)
+    else:
+        _validate_directory_paths((dest.parent,))
     existing = None
     try:
         existing = dest.lstat()
@@ -425,6 +462,8 @@ def _toml_value(value: Any) -> str:
         return repr(value)
     if isinstance(value, str):
         return f'"{toml_escape(value)}"'
+    if isinstance(value, (datetime_types.datetime, datetime_types.date, datetime_types.time)):
+        return value.isoformat()
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
     raise TypeError(f"Unsupported TOML value type: {type(value).__name__}")
@@ -595,6 +634,7 @@ def list_bundled_presets(repo_dir: str | Path) -> list[Path]:
 
 def copy_preset_to_config(source: str | Path, config_dir: str | Path) -> Path:
     """Validate and copy a preset into config.d with the preset prefix."""
+    validate_config_directory(config_dir)
     source_path = Path(source)
     dest = preset_dest_path(config_dir, source_path.name)
     validate_preset_toml(source_path)
@@ -610,6 +650,7 @@ def _filename_from_url(url: str) -> str:
 
 def import_preset_to_config(source: str, config_dir: str | Path) -> Path:
     """Import a preset from a local path or URL into config.d."""
+    validate_config_directory(config_dir)
     if re.match(r"^https?://", source):
         filename = _safe_preset_basename(_filename_from_url(source))
         dest = preset_dest_path(config_dir, filename)
@@ -1295,42 +1336,75 @@ def _select_bundled_presets(ctx: InstallerContext) -> list[Path]:
 
 
 def _next_custom_broker_number(config_dir: str) -> int:
-    """Choose the next custom broker number based on active config snippets."""
-    config_d = Path(config_dir) / "config.d"
+    """Choose a fresh custom name across base settings and active drop-ins."""
+    root = Path(config_dir)
+    base = root / "config.toml"
+    sources = ([base] if base.is_file() else []) + sorted((root / "config.d").glob("*.toml"))
     existing_count = 0
-    for path in config_d.glob("*.toml"):
-        existing_count += path.read_text().count("[[broker]]")
-    return existing_count + 1
+    highest_custom = 0
+    for path in sources:
+        brokers = _load_toml_file(path).get("broker", [])
+        if not isinstance(brokers, list):
+            continue
+        for broker in brokers:
+            if not isinstance(broker, dict):
+                continue
+            existing_count += 1
+            name = broker.get("name", "")
+            match = re.fullmatch(r"custom-([0-9]+)", name) if isinstance(name, str) else None
+            if match:
+                highest_custom = max(highest_custom, int(match.group(1)))
+    return max(existing_count, highest_custom) + 1
 
 
 def _config_dir_has_broker(config_dir: str) -> bool:
-    """Return whether any active config drop-in already contains broker blocks."""
-    config_d = Path(config_dir) / "config.d"
-    if not config_d.is_dir():
-        return False
-    return any("[[broker]]" in path.read_text() for path in config_d.glob("*.toml"))
+    """Find actual broker tables in base settings or active drop-ins."""
+    root = Path(config_dir)
+    base = root / "config.toml"
+    sources = ([base] if base.is_file() else []) + sorted((root / "config.d").glob("*.toml"))
+    for path in sources:
+        brokers = _load_toml_file(path).get("broker", [])
+        if isinstance(brokers, list) and any(isinstance(broker, dict) for broker in brokers):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Update owner info for existing config
 # ---------------------------------------------------------------------------
 
+def _explicit_token_brokers(data: dict[str, Any]) -> list[dict[str, Any]]:
+    brokers = data.get("broker", [])
+    if not isinstance(brokers, list):
+        return []
+    return [broker for broker in brokers
+            if isinstance(broker, dict) and isinstance(broker.get("auth"), dict)
+            and broker["auth"].get("method") == "token"]
+
+
+def has_token_auth_brokers(content: str) -> bool:
+    """Detect explicit token-auth brokers from parsed TOML, regardless of syntax."""
+    return bool(_explicit_token_brokers(tomllib.loads(content)))
+
+
+def token_auth_owner_defaults(content: str) -> tuple[str, str]:
+    """Return shared owner/email defaults only from explicit token-auth brokers."""
+    metadata = {
+        str(index): (str(broker["auth"].get("owner") or ""),
+                     str(broker["auth"].get("email") or ""))
+        for index, broker in enumerate(_explicit_token_brokers(tomllib.loads(content)))
+    }
+    return _shared_metadata_default(metadata, 0), _shared_metadata_default(metadata, 1)
+
+
 def _replace_owner_fields(content: str, owner: str, email: str) -> str:
-    """Replace explicit token-auth owners, preserving preset-only overrides."""
-    blocks = re.split(r'(?=^\[\[broker\]\]\s*$)', content, flags=re.MULTILINE)
-    for index, block in enumerate(blocks):
-        if not block.startswith("[[broker]]"):
-            continue
-        parsed = tomllib.loads(block)
-        if parsed.get("broker", [{}])[0].get("auth", {}).get("method") != "token":
-            continue
+    """Update explicit token auth fields, preserving sparse preset overrides."""
+    data = tomllib.loads(content)
+    for broker in _explicit_token_brokers(data):
         for key, value in (("owner", owner), ("email", email)):
             if value:
-                block = re.sub(rf'^({key}\s*=\s*).*$',
-                               lambda match, v=value: match.group(1) + '"' + toml_escape(v) + '"',
-                               block, flags=re.MULTILINE)
-        blocks[index] = block
-    return "".join(blocks)
+                broker["auth"][key] = value
+    return _toml_dumps(data)
 
 
 def update_owner_info(config_dir: str) -> None:
@@ -1346,28 +1420,21 @@ def update_owner_info(config_dir: str) -> None:
 
     content = Path(user_toml).read_text()
     has_token_presets = bool(token_preset_brokers(config_dir))
-    if 'method = "token"' not in content and not has_token_presets:
+    if not has_token_auth_brokers(content) and not has_token_presets:
         print_warning("No brokers configured with auth token authentication")
         return
 
     if has_token_presets:
         _configure_token_preset_overrides(config_dir)
         content = Path(user_toml).read_text()
-        if 'method = "token"' not in content:
+        if not has_token_auth_brokers(content):
             return
 
     print_info("This will update owner and email for all token-auth brokers")
     print()
 
     # Extract existing owner and email
-    existing_owner = ""
-    existing_email = ""
-    owner_match = re.search(r'^owner\s*=\s*"([^"]*)"', content, re.MULTILINE)
-    if owner_match:
-        existing_owner = owner_match.group(1)
-    email_match = re.search(r'^email\s*=\s*"([^"]*)"', content, re.MULTILINE)
-    if email_match:
-        existing_email = email_match.group(1)
+    existing_owner, existing_email = token_auth_owner_defaults(content)
 
     if existing_owner:
         print_info(f"Current owner: {existing_owner}")
@@ -1420,18 +1487,21 @@ def _read_existing_iata(user_toml: str) -> str:
     """Read the existing IATA code from a user TOML."""
     if not Path(user_toml).exists():
         return ""
-    content = Path(user_toml).read_text()
-    match = re.search(r'^\s*iata\s*=\s*"([^"]*)"', content, re.MULTILINE)
-    return match.group(1) if match else ""
+    general = _load_toml_file(user_toml).get("general", {})
+    if not isinstance(general, dict):
+        return ""
+    iata = general.get("iata", "")
+    return iata if isinstance(iata, str) else ""
 
 
 def _update_iata_in_file(user_toml: str, iata: str) -> None:
     """Update the iata value in a user TOML."""
-    content = Path(user_toml).read_text()
-    content = re.sub(r'^(iata\s*=\s*).*$',
-                     lambda match: match.group(1) + f'"{toml_escape(iata)}"',
-                     content, flags=re.MULTILINE)
-    write_private_config(user_toml, content)
+    data = _load_toml_file(user_toml)
+    general = data.setdefault("general", {})
+    if not isinstance(general, dict):
+        raise ValueError("general must be a TOML table")
+    general["iata"] = iata
+    _write_user_toml(user_toml, data)
 
 
 # Need platform for the import in configure_mqtt_brokers

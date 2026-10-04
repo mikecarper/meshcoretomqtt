@@ -34,6 +34,19 @@ print_info() {
     echo -e "${BLUE}ℹ${NC} $1"
 }
 
+read_prompt() {
+    local prompt_text="$1"
+    local response_variable="$2"
+
+    # curl | sudo bash uses stdin for the script, so answers belong to the
+    # controlling terminal. Headless invocations can supply separate stdin.
+    if { : </dev/tty; } 2>/dev/null; then
+        IFS= read -r -p "$prompt_text" "$response_variable" </dev/tty
+        return $?
+    fi
+    IFS= read -r -p "$prompt_text" "$response_variable"
+}
+
 prompt_yes_no() {
     local prompt="$1"
     local default="${2:-n}"
@@ -45,7 +58,10 @@ prompt_yes_no() {
         prompt="$prompt [y/N]: "
     fi
 
-    read -p "$prompt" response
+    if ! read_prompt "$prompt" response; then
+        print_warning "No answer received; keeping the requested files or service." >&2
+        return 1
+    fi
     response=${response:-$default}
 
     case "$response" in
@@ -60,12 +76,15 @@ prompt_input() {
     local response
 
     if [ -n "$default" ]; then
-        read -p "$prompt [$default]: " response
-        echo "${response:-$default}"
+        prompt="$prompt [$default]: "
     else
-        read -p "$prompt: " response
-        echo "$response"
+        prompt="$prompt: "
     fi
+    if ! read_prompt "$prompt" response; then
+        print_error "No answer received; uninstallation cancelled." >&2
+        return 1
+    fi
+    echo "${response:-$default}"
 }
 
 # Default paths
@@ -78,13 +97,31 @@ for selector in MCTOMQTT_INSTALL_DIR MCTOMQTT_CONFIG_DIR; do
 done
 DEFAULT_APP_DIR="${MCTOMQTT_INSTALL_DIR:-/opt/mctomqtt}"
 DEFAULT_CONFIG_DIR="${MCTOMQTT_CONFIG_DIR:-/etc/mctomqtt}"
+if [ -d "$DEFAULT_CONFIG_DIR" ]; then
+    if ! config_path=$(cd -- "$DEFAULT_CONFIG_DIR" 2>/dev/null && pwd -P); then
+        print_error "Cannot access configuration directory; run the uninstaller with sudo." >&2
+        exit 1
+    fi
+    if [ "$config_path" = "/" ]; then
+        print_error "Configuration directory must not resolve to filesystem root." >&2
+        exit 1
+    fi
+    if [ -d "$DEFAULT_CONFIG_DIR/config.d" ] && [ ! -x "$DEFAULT_CONFIG_DIR/config.d" ]; then
+        print_error "Cannot access private configuration drop-ins; run the uninstaller with sudo." >&2
+        exit 1
+    fi
+fi
 SYSTEMD_UNIT="/etc/systemd/system/mctomqtt.service"
 LAUNCHD_PLIST="/Library/LaunchDaemons/com.meshcore.mctomqtt.plist"
 
 # Detect system type
+docker_container_exists() {
+    [ "$(docker inspect --type container --format '{{.Name}}' mctomqtt 2>/dev/null)" = "/mctomqtt" ]
+}
+
 detect_system_type() {
     # Check for Docker container first
-    if docker ps -a 2>/dev/null | grep -q mctomqtt; then
+    if docker_container_exists; then
         echo "docker"
     elif command -v systemctl &> /dev/null; then
         echo "systemd"
@@ -151,11 +188,11 @@ remove_launchd_service() {
 
 # Remove Docker container and image
 remove_docker() {
-    if docker ps -a 2>/dev/null | grep -q mctomqtt; then
+    if docker_container_exists; then
         print_info "Stopping and removing Docker container..."
 
         # Stop if running
-        if docker ps | grep -q mctomqtt; then
+        if [ "$(docker inspect --type container --format '{{.State.Running}}' mctomqtt 2>/dev/null)" = "true" ]; then
             docker stop mctomqtt
             print_success "Container stopped"
         fi
@@ -168,7 +205,7 @@ remove_docker() {
     fi
 
     # Ask about removing image
-    if docker images | grep -q "mctomqtt"; then
+    if docker image inspect mctomqtt:latest >/dev/null 2>&1; then
         if prompt_yes_no "Remove Docker image (mctomqtt:latest)?" "y"; then
             docker rmi mctomqtt:latest
             print_success "Docker image removed"
@@ -207,6 +244,20 @@ remove_service_user() {
 }
 
 # Remove configuration files
+backup_user_config() {
+    local user_toml="$1"
+    local backup_file
+    backup_file=$(mktemp "$HOME/mctomqtt-user-toml-backup-$(date +%Y%m%d-%H%M%S).toml.XXXXXXXX") || return 1
+    # mktemp creates a new mode-600 file without replacing an existing path.
+    # The shell writes its own private file while sudo reads private config.
+    if ! sudo cat -- "$user_toml" > "$backup_file"; then
+        rm -f -- "$backup_file"
+        print_error "Configuration backup failed; keeping configuration." >&2
+        return 1
+    fi
+    print_success "Configuration backed up to: $backup_file"
+}
+
 remove_config() {
     local config_dir="$DEFAULT_CONFIG_DIR"
     local user_toml="$config_dir/config.d/99-user.toml"
@@ -224,10 +275,10 @@ remove_config() {
         print_info "User configuration file: $user_toml"
 
         if prompt_yes_no "Do you want to back up $(basename "$user_toml") before uninstalling?" "y"; then
-            BACKUP_FILE="$HOME/mctomqtt-user-toml-backup-$(date +%Y%m%d-%H%M%S).toml"
-            sudo cp "$user_toml" "$BACKUP_FILE"
-            sudo chown "$(whoami)" "$BACKUP_FILE"
-            print_success "Configuration backed up to: $BACKUP_FILE"
+            if ! backup_user_config "$user_toml"; then
+                KEEP_CONFIG=true
+                return 1
+            fi
         fi
     fi
 
@@ -263,8 +314,16 @@ main() {
     APP_DIR=$(prompt_input "Application directory" "$DEFAULT_APP_DIR")
     APP_DIR="${APP_DIR/#\~/$HOME}"  # Expand tilde
 
+    if [[ "$APP_DIR" != /* ]]; then
+        print_error "Application directory must be an absolute path: $APP_DIR"
+        exit 1
+    fi
     if [ ! -d "$APP_DIR" ]; then
         print_error "Application directory not found: $APP_DIR"
+        exit 1
+    fi
+    if [ "$(cd -- "$APP_DIR" && pwd -P)" = "/" ] || [ ! -f "$APP_DIR/mctomqtt.py" ]; then
+        print_error "Application directory must contain an installed mctomqtt.py: $APP_DIR"
         exit 1
     fi
 
@@ -318,7 +377,7 @@ main() {
     print_header "Removing Files"
 
     print_info "Removing application directory..."
-    sudo rm -rf "$APP_DIR"
+    sudo rm -rf -- "$APP_DIR"
     print_success "Application directory removed: $APP_DIR"
 
     # Offer to remove the service user (systemd only)

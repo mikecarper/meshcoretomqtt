@@ -157,6 +157,21 @@ def test_full_companion_bare_response_and_unframed_prompt():
         assert queued_lines(radio.connection) == []
 
 
+@pytest.mark.parametrize('second_reply', [
+    b'  -> >' + b'AA' * 32 + b'\r\n> ',
+    b'  > ' + b'AA' * 32 + b'\r\n> ',
+])
+def test_leftover_prompt_does_not_corrupt_next_getter_without_command_echo(second_reply):
+    with PtyRadio({'get name': b'  -> >NodeA\r\n> ',
+                   'get public.key': second_reply}) as radio:
+        assert radio.connection.get_name() == 'NodeA'
+        # The legacy reply completes before its following terminal prompt's
+        # quiet poll. The next query can therefore receive that prompt prefix.
+        assert radio.connection.get_pubkey() == 'AA' * 32
+        assert radio.connection.is_open
+        assert queued_lines(radio.connection) == []
+
+
 @pytest.mark.parametrize("name", [
     "DEBUGNode", "BLE: relay", "MQTT: relay", "WiFi: relay",
     "RX, len=2", "19:00:00 - 3/10/2026 node", "get name",

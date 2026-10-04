@@ -284,10 +284,12 @@ def test_publish_stall_retires_client_and_ignores_late_callbacks():
     info = state.mqtt_clients[0]
     assert not info['connected']
     assert info['failed_attempts'] == 1
+    assert old.stops == 1
+    assert info['client'] is None
     clock.now = info['reconnect_at']
     manager.reconnect_disconnected_brokers()
     assert old.stops == 1
-    assert old.close_order == ['disconnect', 'abort', 'loop_stop']
+    assert old.close_order == ['abort', 'disconnect', 'loop_stop']
     old.lost_connection()
     assert info['connected'] and info['failed_attempts'] == 1
 

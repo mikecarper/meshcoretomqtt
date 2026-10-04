@@ -128,7 +128,8 @@ class TestGetBrokerConfig:
         broker = get_broker_config(state, 0)
         assert broker['name'] == 'test-broker'
 
-    def test_invalid_index(self):
+    @pytest.mark.parametrize('index', [-99, -1, 99])
+    def test_invalid_index(self, index):
         state = make_test_state()
-        broker = get_broker_config(state, 99)
+        broker = get_broker_config(state, index)
         assert broker == {}

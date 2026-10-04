@@ -276,6 +276,7 @@ def _cleanup(state: BridgeState, stats_thread: threading.Thread | None) -> None:
     """Shut down background threads, publish offline status, and close connections."""
     logger.info("Cleaning up...")
     state.should_exit = True
+    state.shutdown_event.set()
     if state.mqtt_manager:
         begin_shutdown = getattr(state.mqtt_manager, 'begin_shutdown', None)
         if begin_shutdown is not None:

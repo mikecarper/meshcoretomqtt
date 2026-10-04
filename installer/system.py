@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import grp
 import os
 import platform
 import plistlib
@@ -280,13 +281,17 @@ def require_root() -> None:
 
 
 def chown_recursive(path: str, user: str, group: str) -> None:
-    """Recursively chown a directory tree."""
-    shutil.chown(path, user, group)
+    """Change tree/link ownership without transferring external targets."""
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(group).gr_gid
+    os.chown(path, uid, gid, follow_symlinks=False)
+    if os.path.islink(path):
+        return
     for dirpath, dirnames, filenames in os.walk(path):
         for d in dirnames:
-            shutil.chown(os.path.join(dirpath, d), user, group)
+            os.chown(os.path.join(dirpath, d), uid, gid, follow_symlinks=False)
         for f in filenames:
-            shutil.chown(os.path.join(dirpath, f), user, group)
+            os.chown(os.path.join(dirpath, f), uid, gid, follow_symlinks=False)
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +480,10 @@ def create_system_user(svc_user: str, install_dir: str) -> None:
 
 def set_permissions(install_dir: str, config_dir: str, svc_user: str) -> None:
     """Set directory ownership and permissions."""
+    config_root = Path(config_dir)
+    config_d = config_root / "config.d"
+    if config_root.is_symlink() or config_d.is_symlink():
+        raise ValueError("Configuration directories must not be symlinks")
     # /opt/mctomqtt owned by svc_user:svc_user
     chown_recursive(install_dir, svc_user, svc_user)
     print_success(f"{install_dir} owned by {svc_user}:{svc_user}")
@@ -482,16 +491,16 @@ def set_permissions(install_dir: str, config_dir: str, svc_user: str) -> None:
     # Config directories are owned by root:svc_user, mode 750 (private group access).
     chown_recursive(config_dir, "root", svc_user)
     os.chmod(config_dir, 0o750)
-    config_d = Path(config_dir) / "config.d"
     if config_d.exists():
         os.chmod(str(config_d), 0o750)
 
     config_toml = Path(config_dir) / "config.toml"
-    if config_toml.exists():
+    if config_toml.exists() and not config_toml.is_symlink():
         os.chmod(str(config_toml), 0o640)
 
     for override in config_d.glob("*.toml*") if config_d.exists() else []:
-        os.chmod(str(override), 0o640)
+        if not override.is_symlink():
+            os.chmod(str(override), 0o640)
 
     print_success(f"Permissions set on {config_dir} (root:{svc_user}, 750/640)")
 

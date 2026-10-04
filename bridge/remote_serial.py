@@ -77,6 +77,12 @@ def _command_fields(state: BridgeState, payload: Any) -> tuple[str, str, str, st
     return public_key.upper(), command, target.upper(), nonce, expires
 
 
+def get_serial_commands_topic(state: BridgeState, broker_idx: int) -> str:
+    """Resolve the exact per-broker command subscription topic."""
+    return topics.resolve_topic_template(
+        state, 'meshcore/{IATA}/{PUBLIC_KEY}/serial/commands', broker_idx)
+
+
 def subscribe_serial_commands(state: BridgeState, client: BrokerClient, broker_idx: int) -> None:
     """Subscribe to the serial/commands topic for this node."""
     if not state.remote_serial_enabled:
@@ -88,8 +94,7 @@ def subscribe_serial_commands(state: BridgeState, client: BrokerClient, broker_i
         logger.warning(f"[{broker_name}] Cannot subscribe to serial commands - public key not available")
         return
 
-    topic = topics.resolve_topic_template(
-        state, 'meshcore/{IATA}/{PUBLIC_KEY}/serial/commands', broker_idx)
+    topic = get_serial_commands_topic(state, broker_idx)
 
     broker = topics.get_broker_config(state, broker_idx)
     broker_name = broker.get('name', f'broker-{broker_idx}')
@@ -102,6 +107,8 @@ def subscribe_serial_commands(state: BridgeState, client: BrokerClient, broker_i
 
 def handle_serial_command(state: BridgeState, jwt_token: str, broker_idx: int) -> None:
     """Process an incoming serial command JWT."""
+    if state.should_exit:
+        return
     if not state.remote_serial_enabled:
         logger.warning("[SERIAL] Remote serial command received but feature is disabled")
         return

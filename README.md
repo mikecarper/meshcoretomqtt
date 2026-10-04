@@ -428,6 +428,11 @@ keeps one serial-session reference across USB reconnects. An accepted nonce
 stays consumed even if execution fails or the response cannot be delivered;
 retry with a freshly signed nonce. This cache is in-memory, not persistent
 across service restarts; keep token lifetimes short.
+Remote commands are accepted only on the exact subscribed topic for that
+broker and node, and are ignored once shutdown begins. Remote serial settings
+require TOML booleans, string arrays and a positive finite command timeout.
+Token verification requires a 32-byte public key, a 64-byte signature and, when
+present, a finite numeric expiry; a token is expired at its expiry instant.
 
 ## Running the Script
 
@@ -523,12 +528,14 @@ longer purge pending packets. POSIX serial opens request exclusive ownership.
 Statistics polling retains one session reference during reconnect and ignores
 results from retired sessions, so a disconnected port cannot stop the worker
 or replace current statistics with a late reply.
+Shutdown wakes an idle statistics worker immediately instead of waiting for
+its five-minute polling interval.
 
 The defaults bound unfinished lines to 4096 bytes, queued log records to 256,
 and complete command responses to 64 KiB. Lines without a terminator are
 discarded after 5 seconds, through the next newline. Queue overflow drops
 oldest whole records and emits `DROP:<count>`. A drop, invalid RAW record,
-mismatched timestamp/length or expired pairing clears the cached RAW payload;
+mismatched timestamp/length, malformed packet summary or expired pairing clears the cached RAW payload;
 a valid RAW record is consumed by only one packet summary. A summary can
 therefore legitimately contain `"raw": null` after capture loss. Matching
 timestamps and lengths are safeguards, not unique packet identifiers.
@@ -565,6 +572,8 @@ unlimited backlog. Accepted is not the same as delivered: QoS 0 completion
 means handed to the socket, not acknowledged by the broker. A publication
 pending for 120 seconds causes that connection to be retired. These defaults
 can be tuned with the serial/broker options in `config.toml.example`.
+Failed connections close immediately, including during reconnect backoff,
+without suppressing the broker's offline Last Will.
 
 Each broker uses its own client-ID prefix. IDs over the portable 23-character
 limit include a 64-bit digest of the full prefix, node identity and broker suffix;
@@ -666,6 +675,7 @@ curl -fsSL https://raw.githubusercontent.com/Cisien/meshcoretomqtt/main/scripts/
 
 The migrator will:
 
+- Preserve effective `.env` settings with `.env.local` overrides, including unchanged broker connection defaults
 - Escape and validate `.env`/`.env.local` conversion before retiring a working legacy service
 - Atomically write private TOML without printing credentials or overwriting existing user configuration
 - Stop and remove old systemd/launchd services
@@ -683,6 +693,10 @@ The uninstaller will:
 - Offer to backup your `99-user.toml` configuration
 - Remove `/opt/mctomqtt/` and `/etc/mctomqtt/`
 - Remove the `mctomqtt` system user
+
+For custom paths, set absolute `MCTOMQTT_INSTALL_DIR` and
+`MCTOMQTT_CONFIG_DIR` values when invoking the uninstaller. It shows the user
+configuration path without printing credentials.
 
 ## Privacy
 

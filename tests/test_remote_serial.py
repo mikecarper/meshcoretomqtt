@@ -11,7 +11,7 @@ from bridge.remote_serial import (
     is_command_allowed,
     subscribe_serial_commands,
 )
-from bridge.state import parse_allowed_companions
+from bridge.state import BridgeState, parse_allowed_companions
 from tests.fakes import (
     FakeAuthProvider,
     FakeBrokerClient,
@@ -55,6 +55,18 @@ def _make_remote_state(**kwargs):
 
 
 class TestHandleSerialCommand:
+    def test_late_command_after_shutdown_has_no_nonce_or_response_side_effects(self):
+        state = _make_remote_state()
+        broker = FakeBrokerClient()
+        state.mqtt_clients = [{'client': broker, 'broker_idx': 0, 'connected': True}]
+        state.should_exit = True
+
+        handle_serial_command(state, _make_command_token(state.auth), broker_idx=0)
+
+        assert state.device.commands_executed == []
+        assert state.remote_serial_nonces == {}
+        assert broker.published == []
+
     def test_valid_command(self):
         state = _make_remote_state()
         broker = FakeBrokerClient()
@@ -219,3 +231,29 @@ class TestSubscribeSerialCommands:
         client = FakeBrokerClient()
         subscribe_serial_commands(state, client, broker_idx=0)
         assert len(client.subscribed) == 0
+
+
+@pytest.mark.parametrize('name, value', [
+    ('enabled', 'false'), ('enabled', 1),
+    ('allowed_companions', 'AA' * 32), ('allowed_companions', ['AA' * 32, 42]),
+    ('allowed_companions', {}),
+    ('disallowed_commands', 'erase'), ('disallowed_commands', ['erase', 42]),
+    ('command_timeout', 0), ('command_timeout', -1), ('command_timeout', True),
+    ('command_timeout', '10'), ('command_timeout', float('inf')),
+    ('command_timeout', float('nan')),
+])
+def test_invalid_remote_command_config_fails_before_callbacks(name, value):
+    with pytest.raises(ValueError, match=f'remote_serial.{name}'):
+        BridgeState({'remote_serial': {name: value}})
+
+
+@pytest.mark.parametrize('timeout', [0.5, 10, 120.0])
+def test_remote_command_timeout_accepts_positive_finite_numbers(timeout):
+    state = BridgeState({'remote_serial': {'command_timeout': timeout}})
+    assert state.remote_serial_command_timeout == timeout
+
+
+@pytest.mark.parametrize('remote_config', [False, [], 'enabled'])
+def test_remote_command_config_requires_a_table(remote_config):
+    with pytest.raises(ValueError, match='remote_serial must be a configuration table'):
+        BridgeState({'remote_serial': remote_config})

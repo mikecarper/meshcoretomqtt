@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import http.server
+import grp
 import inspect
 import json
 import os
 import pathlib
 import plistlib
+import pwd
 import shutil
 import subprocess
 import sys
@@ -20,11 +22,81 @@ from installer.config import _replace_owner_fields, _toml_dumps, toml_escape, wr
 from installer.install_cmd import load_config_url
 from installer.migrate_cmd import prepare_migrated_config, run_migrate
 from installer.system import (
+    chown_recursive,
     docker_run_command, install_launchd_service, install_systemd_service,
     render_launchd_plist, render_systemd_template, stage_dockerfile,
+    set_permissions,
 )
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def test_recursive_ownership_accepts_dangling_symlinks_without_following_them(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    link = app / "missing-interpreter"
+    link.symlink_to(tmp_path / "missing-target")
+
+    chown_recursive(str(app), pwd.getpwuid(os.getuid()).pw_name,
+                    grp.getgrgid(os.getgid()).gr_name)
+
+    assert link.is_symlink()
+    assert not link.exists()
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "root-directory"])
+def test_recursive_ownership_changes_links_without_changing_external_targets(tmp_path, kind):
+    groups = set(os.getgroups()) - {os.getgid()}
+    if os.getuid() == 0:
+        groups.update(entry.gr_gid for entry in grp.getgrall() if entry.gr_gid != os.getgid())
+    if not groups:
+        pytest.skip("requires root or a supplementary group to observe an ownership change")
+    selected_group = min(groups)
+    external = tmp_path / "outside"
+    external.mkdir()
+    target = external / "host-python"
+    target.write_text("host executable must keep its ownership")
+    original = {path: (path.stat().st_uid, path.stat().st_gid)
+                for path in (external, target)}
+    app = tmp_path / "app"
+    if kind == "root-directory":
+        app.symlink_to(external, target_is_directory=True)
+        link = app
+    else:
+        app.mkdir()
+        link = app / "linked-target"
+        link.symlink_to(target if kind == "file" else external,
+                       target_is_directory=kind == "directory")
+
+    chown_recursive(str(app), pwd.getpwuid(os.getuid()).pw_name,
+                    grp.getgrgid(selected_group).gr_name)
+
+    assert link.lstat().st_gid == selected_group
+    assert {path: (path.stat().st_uid, path.stat().st_gid)
+            for path in (external, target)} == original
+
+
+@pytest.mark.parametrize("kind", ["config-root", "config-drop-ins"])
+def test_config_directory_links_are_rejected_before_changing_permissions(tmp_path, kind):
+    app = tmp_path / "app"
+    app.mkdir()
+    external = tmp_path / "outside"
+    external.mkdir()
+    original = external.stat()
+    config = tmp_path / "config"
+    if kind == "config-root":
+        config.symlink_to(external, target_is_directory=True)
+    else:
+        config.mkdir()
+        (config / "config.d").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="Configuration directories must not be symlinks"):
+        set_permissions(str(app), str(config), pwd.getpwuid(os.getuid()).pw_name)
+
+    after = external.stat()
+    assert (after.st_uid, after.st_gid, after.st_mode) == (
+        original.st_uid, original.st_gid, original.st_mode)
+
 
 
 @pytest.mark.parametrize("script", ["install.sh", "scripts/update.sh", "scripts/migrate.sh"])
@@ -144,6 +216,50 @@ def test_migration_preparation_is_valid_private_and_precedes_service_retirement(
     assert source.index("prepare_migrated_config(") < source.index("_stop_old_services(")
     assert source.index("prepare_migrated_config(") < source.index("_cleanup_old_service_units(")
     assert 'print(content)' not in source
+
+
+def test_migration_keeps_required_broker_settings_that_match_legacy_defaults(tmp_path):
+    if pathlib.Path("/etc/systemd/system/mctomqtt.service").exists():
+        pytest.skip("isolated migration test does not retire a real installed unit")
+    home = tmp_path / "home"
+    legacy = home / ".meshcoretomqtt"
+    legacy.mkdir(parents=True)
+    (legacy / "mctomqtt.py").write_text("# legacy bridge\n")
+    settings = (
+        'MCTOMQTT_IATA=SEA\nMCTOMQTT_SERIAL_PORTS=/dev/ttyUSB7\n'
+        'MCTOMQTT_MQTT1_ENABLED=true\nMCTOMQTT_MQTT1_SERVER=mqtt.invalid\n'
+        'MCTOMQTT_MQTT1_PORT=443\nMCTOMQTT_MQTT1_TRANSPORT=websockets\n'
+        'MCTOMQTT_MQTT1_USE_TLS=true\nMCTOMQTT_MQTT1_USE_AUTH_TOKEN=true\n'
+    )
+    (legacy / ".env").write_text(settings)
+    (legacy / ".env.local").write_text('MCTOMQTT_MQTT1_TOKEN_EMAIL=owner@example.com\n')
+    selected = tmp_path / "selected-source"
+    selected.mkdir()
+    (selected / ".env").write_text(settings)
+    config = tmp_path / "config"
+    environment = dict(os.environ, HOME=str(home))
+    environment.pop("SUDO_USER", None)
+    script = (
+        "import sys\nfrom installer import InstallerContext\n"
+        "from installer.migrate_cmd import run_migrate\n"
+        "ctx=InstallerContext(install_dir=sys.argv[1], config_dir=sys.argv[2], local_install=sys.argv[3])\n"
+        "assert run_migrate(ctx)\n"
+    )
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path / "app"),
+                             str(config), str(selected)], input="y\n", env=environment,
+                            capture_output=True, text=True, cwd=ROOT,
+                            start_new_session=True, timeout=5)
+
+    assert result.returncode == 0, result.stderr
+    migrated = tomllib.loads((config / "config.d/99-user.toml").read_text())
+    assert migrated["serial"]["ports"] == ["/dev/ttyUSB7"]
+    broker = migrated["broker"][0]
+    assert broker["server"] == "mqtt.invalid"
+    assert broker["enabled"] is True
+    assert broker["transport"] == "websockets"
+    assert broker["port"] == 443
+    assert broker["tls"] == {"enabled": True, "verify": True}
+    assert broker["auth"] == {"method": "token", "email": "owner@example.com"}
 
 
 @pytest.mark.parametrize("filename", ["99-user.toml", "00-user.toml"])

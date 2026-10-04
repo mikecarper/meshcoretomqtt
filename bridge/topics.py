@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 def get_broker_config(state: BridgeState, broker_idx: int) -> dict[str, Any]:
     """Get broker config by index into the broker list."""
     brokers = state.config.get('broker', [])
-    if broker_idx < len(brokers):
+    if 0 <= broker_idx < len(brokers):
         return brokers[broker_idx]
     return {}
 

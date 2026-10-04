@@ -69,8 +69,15 @@ prompt_input() {
 }
 
 # Default paths
-DEFAULT_APP_DIR="/opt/mctomqtt"
-DEFAULT_CONFIG_DIR="/etc/mctomqtt"
+for selector in MCTOMQTT_INSTALL_DIR MCTOMQTT_CONFIG_DIR; do
+    selected_dir="${!selector:-}"
+    if [[ -n "$selected_dir" && "$selected_dir" != /* ]]; then
+        echo "Error: $selector must be an absolute path." >&2
+        exit 1
+    fi
+done
+DEFAULT_APP_DIR="${MCTOMQTT_INSTALL_DIR:-/opt/mctomqtt}"
+DEFAULT_CONFIG_DIR="${MCTOMQTT_CONFIG_DIR:-/etc/mctomqtt}"
 SYSTEMD_UNIT="/etc/systemd/system/mctomqtt.service"
 LAUNCHD_PLIST="/Library/LaunchDaemons/com.meshcore.mctomqtt.plist"
 
@@ -214,13 +221,7 @@ remove_config() {
 
     # Offer to back up the user TOML before removal
     if [ -f "$user_toml" ]; then
-        echo "Your user configuration file:"
-        echo ""
-        cat "$user_toml" | head -20
-        if [ $(wc -l < "$user_toml") -gt 20 ]; then
-            echo "..."
-        fi
-        echo ""
+        print_info "User configuration file: $user_toml"
 
         if prompt_yes_no "Do you want to back up $(basename "$user_toml") before uninstalling?" "y"; then
             BACKUP_FILE="$HOME/mctomqtt-user-toml-backup-$(date +%Y%m%d-%H%M%S).toml"

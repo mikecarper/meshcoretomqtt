@@ -61,3 +61,55 @@ def test_bootstrap_removes_temporary_directory_when_tmpdir_contains_spaces(scrip
     assert result.returncode == 0, result.stderr
     assert "usage:" in result.stdout
     assert list(temporary_parent.iterdir()) == []
+
+
+def test_uninstaller_uses_selected_paths_without_printing_config_credentials(tmp_path):
+    app = tmp_path / "app spaces"
+    config = tmp_path / "config spaces"
+    app.mkdir()
+    (config / "config.d").mkdir(parents=True)
+    (config / "config.toml").write_text('[general]\niata="SEA"\n')
+    secret = "uninstaller-must-not-display-this-password"
+    user_toml = config / "config.d/99-user.toml"
+    user_toml.write_text(f'[[broker]]\nname="test"\n[broker.auth]\npassword="{secret}"\n')
+    commands = tmp_path / "commands.jsonl"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    sudo = bin_dir / "sudo"
+    sudo.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        "with open(os.environ['COMMAND_RECORD'], 'a') as output:\n"
+        "    output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+    )
+    sudo.chmod(0o755)
+    source = (ROOT / "uninstall.sh").read_text()
+    script = source[:source.index("# Run main")]
+    script += '\nprintf "Selected app: %s\\n" "$DEFAULT_APP_DIR"\nremove_config\n'
+    environment = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}",
+                       COMMAND_RECORD=str(commands),
+                       MCTOMQTT_INSTALL_DIR=str(app), MCTOMQTT_CONFIG_DIR=str(config))
+
+    result = subprocess.run(["bash", "-c", script], input="n\ny\n", env=environment,
+                            capture_output=True, text=True, timeout=5)
+
+    # No backup, then agree to remove only the selected configuration.
+    # Prompt responses are supplied separately from the script stdin.
+    assert result.returncode == 0, result.stderr
+    assert str(app) in result.stdout
+    assert str(user_toml) in result.stdout
+    assert secret not in result.stdout + result.stderr
+    logged = [json.loads(line) for line in commands.read_text().splitlines()]
+    assert logged == [["rm", "-f", str(config / "config.toml")],
+                      ["rm", "-rf", str(config / "config.d")],
+                      ["rm", "-rf", str(config)]]
+    assert user_toml.is_file()  # The fake sudo never performs removals.
+
+
+@pytest.mark.parametrize("selector", ["MCTOMQTT_INSTALL_DIR", "MCTOMQTT_CONFIG_DIR"])
+def test_uninstaller_rejects_relative_directory_selectors_before_prompting(selector):
+    environment = dict(os.environ, **{selector: "relative/path"})
+    result = subprocess.run(["bash", str(ROOT / "uninstall.sh")], env=environment,
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode == 1
+    assert f"{selector} must be an absolute path" in result.stderr
+    assert "This will remove" not in result.stdout

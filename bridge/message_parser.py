@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 RAW_PATTERN = re.compile(r"(\d{2}:\d{2}:\d{2}) - (\d{1,2}/\d{1,2}/\d{4}) U RAW: (.*)")
 MAX_RAW_BYTES = 255
 RAW_PAIR_TIMEOUT = 5.0
+PACKET_PREFIX_PATTERN = re.compile(
+    r"\d{2}:\d{2}:\d{2} - \d{1,2}/\d{1,2}/\d{4} U: (?:RX|TX),"
+)
 PACKET_PATTERN = re.compile(
     r"(\d{2}:\d{2}:\d{2}) - (\d{1,2}/\d{1,2}/\d{4}) U: (RX|TX), len=(\d+) \(type=(\d+), route=([A-Z]), payload_len=(\d+)\)"
     r"(?: SNR=(-?\d+) RSSI=(-?\d+) score=(\d+)(?: time=(\d+))?)?"
@@ -75,6 +78,14 @@ def parse_and_publish(state: BridgeState, line: str) -> None:
 
     # Handle Packet messages (RX and TX)
     packet_match = PACKET_PATTERN.match(line)
+    if packet_match is None:
+        if PACKET_PREFIX_PATTERN.match(line):
+            # A malformed or newer-format summary still ends this RAW pair.
+            # Otherwise its payload could be attached to a different packet
+            # with the same length and firmware timestamp a moment later.
+            state.last_raw = None
+            state.last_raw_stamp = None
+        return
     if packet_match:
         direction = packet_match.group(3).lower()
         raw = state.last_raw

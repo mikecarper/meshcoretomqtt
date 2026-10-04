@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import base64
-import hashlib
+import math
 import time
 import sys
 from typing import Any
@@ -17,6 +17,19 @@ def base64url_encode(data: bytes) -> str:
     """Base64url encode without padding"""
     return base64.urlsafe_b64encode(data).rstrip(b'=').decode('utf-8')
 
+
+def _check_token_expiration(payload: dict[str, Any], now: float | None = None) -> None:
+    """Reject malformed NumericDates and the expiry boundary itself."""
+    if 'exp' not in payload:
+        return
+    expires = payload['exp']
+    if (isinstance(expires, bool) or not isinstance(expires, (int, float))
+            or not math.isfinite(expires)):
+        raise ValueError("Invalid token expiry: expected a finite number")
+    if now is not None and now >= expires:
+        raise ValueError("Token has expired")
+
+
 def create_auth_token(public_key_hex: str, private_key_hex: str, expiry_seconds: int = 3600, **claims: Any) -> str:
     """
     Create a JWT-style auth token for MeshCore MQTT authentication
@@ -24,7 +37,7 @@ def create_auth_token(public_key_hex: str, private_key_hex: str, expiry_seconds:
     Args:
         public_key_hex: 32-byte public key in hex format
         private_key_hex: 64-byte private key in hex format (MeshCore format)
-        expiry_seconds: Token expiry time in seconds (default 24 hours)
+        expiry_seconds: Token expiry time in seconds (default 1 hour)
         **claims: Additional JWT claims (e.g., audience="mqtt.example.com", sub="device-123")
 
     Returns:
@@ -48,11 +61,14 @@ def create_auth_token(public_key_hex: str, private_key_hex: str, expiry_seconds:
         exp = iat + expiry_seconds
 
         payload = {
-            "publicKey": public_key_hex.upper(),
+            "publicKey": pubkey_bytes.hex().upper(),
             "iat": iat,
             "exp": exp
         }
         payload.update(claims)
+        # Keep the creator and verifier consistent without preventing callers
+        # from creating already-expired tokens for diagnostics.
+        _check_token_expiration(payload)
 
         # Encode header and payload to JSON (no spaces to match Node.js)
         header_json = json.dumps(header, separators=(',', ':'))
@@ -99,24 +115,31 @@ def verify_auth_token(token: str, expected_public_key_hex: str | None = None) ->
         payload = decode_token_payload(token)
 
         token_pubkey_hex = payload.get('publicKey')
-        if not token_pubkey_hex:
+        if not isinstance(token_pubkey_hex, str) or not token_pubkey_hex:
             raise Exception("Token payload missing publicKey")
-
-        if expected_public_key_hex and token_pubkey_hex.upper() != expected_public_key_hex.upper():
-            raise Exception("Token public key does not match expected public key")
 
         # Verify signature
         signing_input = f"{header_encoded}.{payload_encoded}"
         pubkey_bytes = bytes.fromhex(token_pubkey_hex)
         signature_bytes = bytes.fromhex(signature_hex)
+        # The native library takes pointers with no buffer lengths. Validate
+        # before calling it, so short values cannot trigger out-of-bounds reads
+        # and appended bytes cannot be silently ignored.
+        if len(pubkey_bytes) != 32:
+            raise Exception("Invalid public key length: expected 32 bytes")
+        if len(signature_bytes) != 64:
+            raise Exception("Invalid signature length: expected 64 bytes")
+
+        if expected_public_key_hex is not None:
+            expected_bytes = bytes.fromhex(expected_public_key_hex)
+            if len(expected_bytes) != 32 or pubkey_bytes != expected_bytes:
+                raise Exception("Token public key does not match expected public key")
 
         if not ed25519_verify(signature_bytes, signing_input.encode('utf-8'), pubkey_bytes):
             raise Exception("Invalid signature")
 
         # Check expiration
-        now = int(time.time())
-        if 'exp' in payload and now > payload['exp']:
-            raise Exception("Token has expired")
+        _check_token_expiration(payload, time.time())
 
         return payload
 
@@ -153,7 +176,10 @@ def decode_token_payload(token: str) -> dict[str, Any]:
             payload_b64 += '=' * padding
 
         payload_bytes = base64.urlsafe_b64decode(payload_b64)
-        return json.loads(payload_bytes.decode('utf-8'))
+        payload = json.loads(payload_bytes.decode('utf-8'))
+        if not isinstance(payload, dict):
+            raise ValueError("Token payload must be an object")
+        return payload
 
     except json.JSONDecodeError as e:
         raise Exception(f"Failed to decode token payload: {e}")
@@ -171,7 +197,8 @@ def read_private_key_file(filepath: str) -> str:
             key = ''.join(key.split())
             if len(key) != 128:  # 64 bytes = 128 hex chars
                 raise ValueError(f"Invalid private key length: {len(key)} (expected 128)")
-            int(key, 16)
+            if any(char not in '0123456789abcdefABCDEF' for char in key):
+                raise ValueError("Private key must contain only hexadecimal digits")
             return key
     except FileNotFoundError:
         raise Exception(f"Private key file not found: {filepath}")

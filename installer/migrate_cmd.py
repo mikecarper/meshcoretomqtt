@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import os
 import platform
-import subprocess
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .system import download_repo_archive, run_cmd
+from .system import run_cmd
 from .config import toml_escape, write_private_config
 from .ui import (
     print_header,
@@ -268,41 +266,12 @@ def run_migrate(ctx: InstallerContext) -> bool:
     old_env = os.path.join(old_dir, ".env")
     old_env_local = os.path.join(old_dir, ".env.local")
 
-    # Get repo's default .env for diffing
-    repo_defaults: dict[str, str] = {}
-    if os.path.exists(old_env):
-        # Use already-downloaded repo archive if available, otherwise download it
-        repo_dir = ctx.repo_dir
-        if not repo_dir and ctx.local_install:
-            repo_dir = ctx.local_install
-        if not repo_dir:
-            try:
-                migrate_tmp = tempfile.mkdtemp()
-                repo_dir = download_repo_archive(ctx.repo, ctx.branch, migrate_tmp)
-                ctx.repo_dir = repo_dir
-            except subprocess.CalledProcessError:
-                repo_dir = ""
-
-        if repo_dir:
-            default_env = os.path.join(repo_dir, ".env")
-            if os.path.exists(default_env):
-                repo_defaults = parse_env_file(default_env)
-
-    # Parse user's env files
+    # Preserve the effective legacy settings. The new TOML defaults need not
+    # reproduce a legacy source's defaults, and broker fields such as server
+    # and enabled must survive even when only credentials were customized.
     user_env = parse_env_file(old_env)
     user_env_local = parse_env_file(old_env_local)
-
-    # Detect customizations in .env vs repo default
-    env_customizations: dict[str, str] = {}
-    for key, value in user_env.items():
-        if key in repo_defaults and repo_defaults[key] != value:
-            env_customizations[key] = value
-        elif key not in repo_defaults:
-            env_customizations[key] = value
-
-    # Merge: env customizations + env.local overrides
-    merged: dict[str, str] = {}
-    merged.update(env_customizations)
+    merged = dict(user_env)
     merged.update(user_env_local)
 
     migrated_toml_path = prepare_migrated_config(merged, ctx.config_dir)

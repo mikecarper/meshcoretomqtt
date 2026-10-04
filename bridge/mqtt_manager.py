@@ -198,7 +198,7 @@ class MqttManager:
         graceful_deadline = time.monotonic() + 1.0
         for client, confirmed in clients:
             self._close_client(
-                client, preserve_lwt=self.state.should_exit and not confirmed,
+                client, preserve_lwt=not confirmed,
                 graceful_timeout=max(0.0, graceful_deadline - time.monotonic())
                 if confirmed else None,
             )
@@ -283,13 +283,21 @@ class MqttManager:
                     if now - since < self.connection_grace:
                         continue
                     self._record_failure(info, now, 'CONNACK timeout')
-                if state.should_exit or now < info.get('reconnect_at', 0):
+                retry_due = not state.should_exit and now >= info.get('reconnect_at', 0)
+                if not retry_due and not info.get('attempt_failed', False):
                     continue
                 old_client = info.get('client')
                 info['client'] = None
-                info['generation'] = info.get('generation', 0) + 1
-                state.token_cache.pop(info['broker_idx'], None)
-            self._close_client(old_client)
+                if old_client is not None or retry_due:
+                    info['generation'] = info.get('generation', 0) + 1
+                if retry_due:
+                    state.token_cache.pop(info['broker_idx'], None)
+            # A failed session is no longer usable, including during backoff.
+            # Abort before DISCONNECT so a publish/CONNACK timeout cannot leave
+            # its retained online status behind by suppressing the offline will.
+            self._close_client(old_client, preserve_lwt=True)
+            if not retry_due:
+                continue
             fresh = self._create_and_connect_broker(info['broker_idx'])
             if fresh:
                 with self._lock:
@@ -353,12 +361,13 @@ class MqttManager:
         state = self.state
         with self._lock:
             info = self._current_callback(client, userdata)
-            if info is None or not info.get('connected', False):
+            if (info is None or not info.get('connected', False)
+                    or state.should_exit):
                 return
             broker_idx = info['broker_idx']
         topic = msg.topic
 
-        if '/serial/commands' not in topic:
+        if topic != remote_serial.get_serial_commands_topic(state, broker_idx):
             return
 
         broker = topics.get_broker_config(state, broker_idx) if broker_idx is not None else {}
@@ -572,5 +581,5 @@ class MqttManager:
                     info['client'] = None
                 if info['generation'] == generation and not self._stop.is_set():
                     self._record_failure(info, self._clock(), f'transport connect failed: {error}')
-            self._close_client(broker_client, preserve_lwt=state.should_exit or self._stop.is_set())
+            self._close_client(broker_client, preserve_lwt=True)
             return None

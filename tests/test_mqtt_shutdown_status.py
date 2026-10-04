@@ -108,11 +108,11 @@ class StatusReceiver(LocalMqttReceiver):
             self.finished.set()
 
 
-def start_manager(receiver, **broker_options):
+def start_manager(receiver, *, client_factory=PahoBrokerClient, **broker_options):
     config = make_config()
     config['broker'][0].update(server='127.0.0.1', port=receiver.port, **broker_options)
     state = make_test_state(config=config, repeater_name='ShutdownNode', repeater_pub_key='AA' * 32)
-    manager = MqttManager(state)
+    manager = MqttManager(state, client_factory=client_factory)
     state.mqtt_manager = manager
     manager.start()
     assert receiver.online.wait(3)
@@ -348,6 +348,58 @@ def test_full_budget_refuses_shutdown_publish_and_preserves_lwt():
         assert not publish_shutdown_status(state, client, 0, timeout=0.1)
         assert manager.stop(timeout=2)
         assert receiver.finished.wait(2)
+        assert not receiver.graceful
+        assert next(iter(receiver.retained.values()))['status'] == 'offline'
+    finally:
+        manager.stop(timeout=2)
+        receiver.close()
+
+
+def test_publish_timeout_retires_transport_during_backoff_and_preserves_lwt():
+    receiver = StatusReceiver(acknowledge=False)
+    config = make_config()
+    config['broker'][0].update(server='127.0.0.1', port=receiver.port,
+                                qos=1, publish_timeout=0.03)
+    state = make_test_state(config=config, repeater_name='StalledNode',
+                            repeater_pub_key='AA' * 32)
+    clock = ManualClock()
+    manager = MqttManager(state, clock=clock, jitter=no_jitter)
+    try:
+        manager.reconnect_disconnected_brokers()
+        assert receiver.online.wait(2)
+        client = state.mqtt_clients[0]['client']
+        wait_until(lambda: client.publish_stalled)
+        manager.reconnect_disconnected_brokers()
+        info = state.mqtt_clients[0]
+        assert info['failed_attempts'] == 1
+        assert info['reconnect_at'] > clock.now
+        # The stalled session must go offline now, even while its next
+        # connection attempt is delayed. DISCONNECT would suppress its will.
+        assert receiver.finished.wait(1)
+        assert info['client'] is None
+        assert not receiver.graceful
+        assert next(iter(receiver.retained.values()))['status'] == 'offline'
+        assert not client.is_connected
+    finally:
+        manager.stop(timeout=2)
+        receiver.close()
+
+
+def test_explicit_manager_stop_without_confirmed_offline_preserves_lwt():
+    receiver = StatusReceiver()
+
+    class ObservedDisconnectClient(PahoBrokerClient):
+        def disconnect(self):
+            super().disconnect()
+            # Let the real MQTT loop and server process DISCONNECT before
+            # returning, rather than relying on a favorable abort/send race.
+            assert receiver.finished.wait(1)
+
+    state, manager, client = start_manager(receiver, client_factory=ObservedDisconnectClient)
+    try:
+        assert not state.should_exit
+        assert manager.stop(timeout=2)
+        assert receiver.finished.wait(1)
         assert not receiver.graceful
         assert next(iter(receiver.retained.values()))['status'] == 'offline'
     finally:

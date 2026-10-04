@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Any, TYPE_CHECKING
@@ -16,6 +17,9 @@ logger = logging.getLogger(__name__)
 def parse_allowed_companions(remote_cfg: dict[str, Any]) -> set[str]:
     """Parse allowed_companions from config into a set of public keys."""
     companions_list = remote_cfg.get('allowed_companions', [])
+    if (not isinstance(companions_list, list)
+            or any(not isinstance(key, str) for key in companions_list)):
+        raise ValueError('remote_serial.allowed_companions must be an array of public key strings')
     if not companions_list:
         return set()
 
@@ -62,6 +66,7 @@ class BridgeState:
 
         # Lifecycle
         self.should_exit: bool = False
+        self.shutdown_event = threading.Event()
 
         # Config-derived values
         self.global_iata: str = config.get('general', {}).get('iata', 'XXX')
@@ -78,12 +83,20 @@ class BridgeState:
 
         # Remote serial config
         remote_cfg = config.get('remote_serial', {})
+        if not isinstance(remote_cfg, dict):
+            raise ValueError('remote_serial must be a configuration table')
         self.remote_serial_enabled: bool = remote_cfg.get('enabled', False)
+        if not isinstance(self.remote_serial_enabled, bool):
+            raise ValueError('remote_serial.enabled must be a boolean')
         self.remote_serial_allowed_companions: set[str] = parse_allowed_companions(remote_cfg)
         self.remote_serial_disallowed_commands: list[str] = remote_cfg.get(
             'disallowed_commands',
             ['get prv.key', 'set prv.key', 'erase', 'password']
         )
+        if (not isinstance(self.remote_serial_disallowed_commands, list)
+                or any(not isinstance(command, str)
+                       for command in self.remote_serial_disallowed_commands)):
+            raise ValueError('remote_serial.disallowed_commands must be an array of strings')
         self.remote_serial_nonce_ttl: int = remote_cfg.get('nonce_ttl', 120)
         self.remote_serial_max_pending_nonces: int = remote_cfg.get('max_pending_nonces', 4096)
         for label, value, maximum in (
@@ -96,7 +109,12 @@ class BridgeState:
         # accepted nonce until its JWT expires, even when nonce_ttl is shorter.
         self.remote_serial_nonces: dict[str, float] = {}
         self.remote_serial_nonce_lock = threading.RLock()
-        self.remote_serial_command_timeout: int = remote_cfg.get('command_timeout', 10)
+        self.remote_serial_command_timeout: float = remote_cfg.get('command_timeout', 10)
+        if (isinstance(self.remote_serial_command_timeout, bool)
+                or not isinstance(self.remote_serial_command_timeout, (int, float))
+                or not math.isfinite(self.remote_serial_command_timeout)
+                or self.remote_serial_command_timeout <= 0):
+            raise ValueError('remote_serial.command_timeout must be a positive finite number')
 
         # Statistics tracking
         self.stats: dict[str, Any] = {

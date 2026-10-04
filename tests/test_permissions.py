@@ -57,3 +57,20 @@ class TestSetPermissions:
         mode = oct(os.stat(config_toml).st_mode)[-3:]
         assert mode == "640"
         assert os.stat(config_dir / "config.d" / "99-user.toml").st_mode & 0o777 == 0o640
+
+    @pytest.mark.parametrize("name", ["config.toml", "config.d/99-user.toml", "config.d/99-backup.toml.backup"])
+    def test_config_links_do_not_change_external_file_permissions(self, dirs, tmp_path, name):
+        install_dir, config_dir = dirs
+        external = tmp_path / "external-config"
+        external.write_text("unrelated file")
+        external.chmod(0o600)
+        before = external.stat()
+        link = config_dir / name
+        link.unlink(missing_ok=True)
+        link.symlink_to(external)
+
+        set_permissions(str(install_dir), str(config_dir), "root")
+
+        after = external.stat()
+        assert (after.st_uid, after.st_gid, after.st_mode) == (
+            before.st_uid, before.st_gid, before.st_mode)

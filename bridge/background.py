@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import time
-from time import sleep
 from typing import TYPE_CHECKING
 
 from . import topics
@@ -20,9 +19,7 @@ def stats_logging_loop(state: BridgeState) -> None:
     stats_interval = 300
 
     while not state.should_exit:
-        sleep(stats_interval)
-
-        if state.should_exit:
+        if state.shutdown_event.wait(stats_interval) or state.should_exit:
             break
 
         # Fetch fresh device stats from serial

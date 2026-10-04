@@ -125,6 +125,19 @@ class TestParseAndPublish:
         assert msg.get('hash') is None
         assert msg['path'] == "BB -> AA"
 
+    @pytest.mark.parametrize('invalid_summary', [
+        '12:34:56 - 1/15/2025 U: RX, len=4 (type=1, route=D, payload_len=2) SNR=bad RSSI=-80 score=100',
+        '12:34:56 - 1/15/2025 U: TX, len=4 (type=1, route=invalid, payload_len=2)',
+    ])
+    def test_malformed_summary_consumes_raw_before_next_packet(self, invalid_summary):
+        state, broker = self._make_state()
+        parse_and_publish(state, '12:34:56 - 1/15/2025 U RAW: AABB0011')
+        parse_and_publish(state, invalid_summary)
+        parse_and_publish(state, '12:34:56 - 1/15/2025 U: TX, len=4 (type=1, route=D, payload_len=2)')
+        assert len(broker.published) == 1
+        assert json.loads(broker.published[0][1])['raw'] is None
+        assert state.stats['packets_tx'] == 1
+
 
 class TestIataInPublishedTopics:
     """End-to-end: configured IATA must appear in every MQTT topic, never SEA."""

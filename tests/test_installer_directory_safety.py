@@ -1,7 +1,10 @@
 """Protect selected configuration directories using real files and links."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -11,6 +14,7 @@ from installer.config import (
     import_preset_to_config,
     validate_config_directory,
     validate_install_directory,
+    validate_install_layout,
     write_private_config,
 )
 
@@ -193,3 +197,139 @@ def test_install_directory_rejects_regular_files(tmp_path):
         validate_install_directory(selected)
 
     assert selected.read_text() == 'keep regular file contents\n'
+
+
+@pytest.mark.parametrize('replacement', ['bridge', 'venv'])
+@pytest.mark.parametrize('nested', [False, True])
+def test_persistent_config_cannot_use_replaced_installation_tree(tmp_path, replacement, nested):
+    app = tmp_path / 'app'
+    config = app / replacement
+    if nested:
+        config /= 'private'
+    (config / 'config.d').mkdir(parents=True)
+    secret = config / 'config.d/99-user.toml'
+    secret.write_text('password="preserve private config"\n')
+    secret.chmod(0o640)
+
+    with pytest.raises(ValueError, match='inside replaceable installation directory'):
+        validate_install_layout(app, config)
+
+    assert secret.read_text() == 'password="preserve private config"\n'
+    assert secret.stat().st_mode & 0o777 == 0o640
+
+
+@pytest.mark.parametrize('selected_alias', ['install', 'config-parent'])
+@pytest.mark.parametrize('replacement', ['bridge', 'venv'])
+def test_replaced_config_tree_is_detected_through_parent_aliases(
+        tmp_path, selected_alias, replacement):
+    app = tmp_path / 'app'
+    config = app / replacement / 'private'
+    (config / 'config.d').mkdir(parents=True)
+    alias = tmp_path / 'app-alias'
+    alias.symlink_to(app, target_is_directory=True)
+    install_dir = alias if selected_alias == 'install' else app
+    config_dir = alias / replacement / 'private' if selected_alias == 'config-parent' else config
+
+    with pytest.raises(ValueError, match='inside replaceable installation directory'):
+        validate_install_layout(install_dir, config_dir)
+
+    assert alias.is_symlink()
+    assert list((config / 'config.d').iterdir()) == []
+
+
+@pytest.mark.parametrize('location', ['app-root', 'config-child', 'bridge-sibling', 'external'])
+def test_persistent_config_outside_replacement_trees_remains_supported(tmp_path, location):
+    app = tmp_path / 'app'
+    config = {'app-root': app, 'config-child': app / 'config',
+              'bridge-sibling': app / 'bridge-config', 'external': tmp_path / 'config'}[location]
+
+    validate_install_layout(app, config)
+
+    assert not app.exists()
+    assert not config.exists()
+
+
+@pytest.mark.parametrize('replacement', ['bridge', 'venv'])
+def test_external_source_update_rejects_config_layout_before_replacing_files(tmp_path, replacement):
+    app = tmp_path / 'app'
+    config = app / replacement / 'private'
+    (config / 'config.d').mkdir(parents=True)
+    (app / 'bridge').mkdir(exist_ok=True)
+    (app / 'bridge/__init__.py').write_text('VERSION="old"\n')
+    (app / 'mctomqtt.py').write_text('__version__="old"\n')
+    (app / '.install_type').write_text('manual')
+    (config / 'config.toml').write_text('[general]\niata="OLD"\n')
+    (config / 'config.d/99-user.toml').write_text('password="private credential"\n')
+    original = {str(path.relative_to(app)): path.read_bytes()
+                for path in app.rglob('*') if path.is_file()}
+    selected = tmp_path / 'selected'
+    (selected / 'bridge').mkdir(parents=True)
+    (selected / 'bridge/__init__.py').write_text('VERSION="new"\n')
+    for name, content in {'mctomqtt.py': '__version__="new"\n', 'auth_token.py': '# auth\n',
+                          'config_loader.py': '# loader\n', 'uninstall.sh': '#!/bin/sh\n',
+                          'config.toml.example': '[general]\niata="NEW"\n'}.items():
+        (selected / name).write_text(content)
+    staging = tmp_path / 'staging'
+    staging.mkdir()
+    # A missing layout guard may install real files, but must never proceed
+    # into dependency installation or external service/account operations.
+    script = '''
+import sys
+from installer import InstallerContext
+from installer.system import create_venv
+from installer.update_cmd import _do_update
+def trace(frame, event, arg):
+    if event == "call" and frame.f_code is create_venv.__code__:
+        raise AssertionError("layout was not rejected before dependency refresh")
+    return trace
+ctx = InstallerContext(install_dir=sys.argv[1], config_dir=sys.argv[2],
+                       local_install=sys.argv[3], svc_user="", update_mode=True)
+sys.settrace(trace)
+try:
+    _do_update(ctx, sys.argv[4])
+except ValueError as error:
+    sys.settrace(None)
+    assert "inside replaceable installation directory" in str(error), error
+    print("LAYOUT_REJECTED")
+else:
+    raise AssertionError("layout was accepted")
+'''
+    result = subprocess.run([sys.executable, '-c', script, str(app), str(config),
+                             str(selected), str(staging)],
+                            cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                            text=True, timeout=5)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'LAYOUT_REJECTED' in result.stdout
+    assert {str(path.relative_to(app)): path.read_bytes()
+            for path in app.rglob('*') if path.is_file()} == original
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.parametrize('command', ['install', 'update', 'migrate'])
+@pytest.mark.parametrize('replacement', ['bridge', 'venv'])
+def test_invalid_persistent_config_layout_is_rejected_before_privilege_check(
+        tmp_path, command, replacement):
+    app = tmp_path / 'app'
+    config = app / replacement / 'private'
+    script = '''
+import sys
+from installer.__main__ import main
+from installer.system import require_root
+def trace(frame, event, arg):
+    if event == "call" and frame.f_code is require_root.__code__:
+        raise AssertionError("privilege check ran before layout rejection")
+    return trace
+sys.settrace(trace)
+sys.argv = ["installer", sys.argv[1]]
+main()
+'''
+    environment = dict(os.environ, MCTOMQTT_INSTALL_DIR=str(app), MCTOMQTT_CONFIG_DIR=str(config))
+    result = subprocess.run([sys.executable, '-c', script, command],
+                            cwd=Path(__file__).resolve().parents[1], env=environment,
+                            capture_output=True, text=True, timeout=5)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert 'inside replaceable installation directory' in result.stderr
+    assert 'privilege check ran' not in result.stderr
+    assert not app.exists()

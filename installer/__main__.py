@@ -6,8 +6,8 @@ import os
 import sys
 
 from . import InstallerContext
-from .config import validate_config_directory, validate_install_directory
-from .system import require_root
+from .config import validate_config_directory, validate_install_directory, validate_install_layout
+from .system import require_root, validate_local_source
 
 
 def main() -> None:
@@ -47,8 +47,6 @@ def main() -> None:
             except (OSError, ValueError) as error:
                 parser.error(f"{selector}: {error}")
 
-    require_root()
-
     ctx = InstallerContext(
         repo=args.repo,
         branch=args.branch,
@@ -56,6 +54,13 @@ def main() -> None:
         config_dir=os.environ.get("MCTOMQTT_CONFIG_DIR") or "/etc/mctomqtt",
         local_install=os.environ.get("LOCAL_INSTALL", ""),
     )
+    try:
+        validate_install_layout(ctx.install_dir, ctx.config_dir)
+        validate_local_source(ctx.install_dir, ctx.local_install)
+    except (OSError, ValueError) as error:
+        parser.error(f"Installation/configuration layout: {error}")
+
+    require_root()
 
     if args.command == "install":
         ctx.config_url = args.config_url

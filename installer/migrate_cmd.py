@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .system import run_cmd
-from .config import toml_escape, write_private_config, validate_config_directory, validate_install_directory
+from .config import toml_escape, write_private_config, validate_config_directory, validate_install_layout
 from .ui import (
     print_header,
     print_info,
@@ -238,8 +238,7 @@ def run_migrate(ctx: InstallerContext) -> bool:
 
     Returns True if migration was performed, False if skipped/nothing to migrate.
     """
-    validate_install_directory(ctx.install_dir)
-    validate_config_directory(ctx.config_dir)
+    validate_install_layout(ctx.install_dir, ctx.config_dir)
     old_dir = detect_old_installation()
     if old_dir is None:
         return False

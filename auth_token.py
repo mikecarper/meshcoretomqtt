@@ -218,7 +218,13 @@ if __name__ == "__main__":
 
     # Existing files take precedence regardless of path length. Normalize an
     # inline key exactly as the file reader does, including split hex digits.
-    if os.path.isfile(private_key_input) or len(private_key_hex) < 128:
+    private_key_is_file = os.path.isfile(private_key_input)
+    if private_key_is_file or len(private_key_hex) < 128:
+        if not private_key_is_file:
+            # A short argument can be either a missing path or an incomplete
+            # private key. Never echo that ambiguous input in diagnostics.
+            print("Error: Private key file not found")
+            sys.exit(1)
         try:
             private_key = read_private_key_file(private_key_input)
             print(f"Loaded private key from: {private_key_input}")

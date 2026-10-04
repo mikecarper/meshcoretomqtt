@@ -97,12 +97,13 @@ for selector in MCTOMQTT_INSTALL_DIR MCTOMQTT_CONFIG_DIR; do
 done
 DEFAULT_APP_DIR="${MCTOMQTT_INSTALL_DIR:-/opt/mctomqtt}"
 DEFAULT_CONFIG_DIR="${MCTOMQTT_CONFIG_DIR:-/etc/mctomqtt}"
+CONFIG_PHYSICAL_DIR=""
 if [ -d "$DEFAULT_CONFIG_DIR" ]; then
-    if ! config_path=$(cd -- "$DEFAULT_CONFIG_DIR" 2>/dev/null && pwd -P); then
+    if ! CONFIG_PHYSICAL_DIR=$(cd -- "$DEFAULT_CONFIG_DIR" 2>/dev/null && pwd -P); then
         print_error "Cannot access configuration directory; run the uninstaller with sudo." >&2
         exit 1
     fi
-    if [ "$config_path" = "/" ]; then
+    if [ "$CONFIG_PHYSICAL_DIR" = "/" ]; then
         print_error "Configuration directory must not resolve to filesystem root." >&2
         exit 1
     fi
@@ -322,7 +323,11 @@ main() {
         print_error "Application directory not found: $APP_DIR"
         exit 1
     fi
-    if [ "$(cd -- "$APP_DIR" && pwd -P)" = "/" ] || [ ! -f "$APP_DIR/mctomqtt.py" ]; then
+    if ! APP_PHYSICAL_DIR=$(cd -- "$APP_DIR" && pwd -P); then
+        print_error "Cannot access application directory: $APP_DIR"
+        exit 1
+    fi
+    if [ "$APP_PHYSICAL_DIR" = "/" ] || [ ! -f "$APP_DIR/mctomqtt.py" ]; then
         print_error "Application directory must contain an installed mctomqtt.py: $APP_DIR"
         exit 1
     fi
@@ -376,9 +381,16 @@ main() {
     # Remove application directory
     print_header "Removing Files"
 
-    print_info "Removing application directory..."
-    sudo rm -rf -- "$APP_DIR"
-    print_success "Application directory removed: $APP_DIR"
+    KEEP_APP=false
+    if [ "$KEEP_CONFIG" = true ] &&
+        [[ "$CONFIG_PHYSICAL_DIR" = "$APP_PHYSICAL_DIR" || "$CONFIG_PHYSICAL_DIR" = "$APP_PHYSICAL_DIR/"* ]]; then
+        KEEP_APP=true
+        print_warning "Keeping application directory because it contains the retained configuration: $APP_DIR"
+    else
+        print_info "Removing application directory..."
+        sudo rm -rf -- "$APP_DIR"
+        print_success "Application directory removed: $APP_DIR"
+    fi
 
     # Offer to remove the service user (systemd only)
     if [ "$SYSTEM_TYPE" = "systemd" ] && [ -n "$SVC_USER" ]; then
@@ -387,9 +399,13 @@ main() {
     fi
 
     # Final message
-    print_header "Uninstallation Complete"
+    print_header "Uninstallation Finished"
 
-    if [ "$KEEP_CONFIG" = true ]; then
+    if [ "$KEEP_APP" = true ]; then
+        echo "Service removal finished. Application and configuration directories kept."
+        echo "Application directory: $APP_DIR"
+        echo "Configuration directory: $DEFAULT_CONFIG_DIR"
+    elif [ "$KEEP_CONFIG" = true ]; then
         echo "MeshCore to MQTT has been removed (configuration kept)."
         echo "Configuration directory: $DEFAULT_CONFIG_DIR"
     else
@@ -397,7 +413,7 @@ main() {
     fi
 
     echo ""
-    print_success "Uninstallation complete!"
+    print_success "Uninstaller finished!"
 }
 
 # Run main

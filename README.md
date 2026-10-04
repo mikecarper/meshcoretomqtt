@@ -61,7 +61,11 @@ sudo LOCAL_INSTALL=$(pwd) ./install.sh
 ```
 
 Install/update stages the bridge package before replacement, including when
-the local checkout and installation directory are the same path.
+the local checkout and installation directory are the same path. Temporary
+files stay outside both package trees even if `TMPDIR` points inside one.
+The same protection applies to a temporary directory inside the installation's
+`venv/`. Keep local sources outside the installed `bridge/` and `venv/` trees,
+which updates may replace.
 
 ### NixOS
 
@@ -376,7 +380,8 @@ only. It's never transmitted or saved to disk.
 For standalone token generation, `auth_token.py PUBLIC_KEY PRIVATE_KEY`
 accepts either an inline hexadecimal private key or a path to an existing key
 file, including long paths. Whitespace is removed from hexadecimal keys in
-both forms.
+both forms. Missing-file errors do not echo inputs that might contain a
+truncated private key.
 
 
 ### Additional Settings
@@ -669,6 +674,8 @@ Existing installations are detected from parsed, layered broker configuration,
 including community presets. Install and update reject linked configuration
 roots or `config.d` directories before writing files. Custom install/config
 paths must be absolute and must not resolve to the filesystem root.
+Keep persistent configuration outside the installation's `bridge/` and
+`venv/` directories, which updates may replace.
 Adding a custom broker chooses an unused `custom-N` name across the active
 configuration files.
 Owner and IATA edits preserve unrelated table values through parsed TOML.
@@ -726,6 +733,9 @@ filesystem root. Configuration backups use unique filenames with owner-only
 permissions; a failed backup stops removal. Prompts use the controlling
 terminal when the script is piped, and end-of-input cancels pending actions.
 Docker detection matches the exact `mctomqtt` container name.
+If you keep configuration stored inside the application directory, the
+uninstaller also keeps that directory to preserve it and reports the retained
+files.
 
 ## Privacy
 

@@ -66,6 +66,19 @@ def validate_install_directory(install_dir: str | Path) -> None:
         raise ValueError(f"Installation path must be a directory: {root}")
 
 
+def validate_install_layout(install_dir: str | Path, config_dir: str | Path) -> None:
+    """Keep persistent configuration outside directories replaced on updates."""
+    validate_install_directory(install_dir)
+    validate_config_directory(config_dir)
+    config_root = Path(config_dir).resolve()
+    for name in ("bridge", "venv"):
+        replaceable = (Path(install_dir) / name).resolve()
+        if config_root.is_relative_to(replaceable):
+            raise ValueError(
+                f"Configuration directory must not be inside replaceable installation directory: {replaceable}"
+            )
+
+
 def user_config_path(config_dir: str | Path) -> Path:
     """Return the canonical user override path."""
     return Path(config_dir) / "config.d" / USER_CONFIG_FILENAME

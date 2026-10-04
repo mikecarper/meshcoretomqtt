@@ -127,7 +127,8 @@ See `config.toml.example` for the full reference with all options and defaults.
   Validate 32-byte public keys and 64-byte signatures before calling the native
   verifier. Present expiry claims must be finite numbers and expire at `exp`.
   The token CLI accepts existing key files regardless of path length and
-  normalizes whitespace in inline hexadecimal keys.
+  normalizes whitespace in inline hexadecimal keys. Missing-file diagnostics
+  must not echo ambiguous input that could be a truncated private key.
 - **Graceful shutdown:** SIGTERM/SIGINT handlers set `state.should_exit = True`. The main loop checks this flag each iteration.
   The supervisor holds transports until explicit stop. Confirm final offline
   using the broker retain policy and a shared five-second budget; abort
@@ -151,12 +152,18 @@ See `config.toml.example` for the full reference with all options and defaults.
 - **Installer safety:** Validate TOML before atomic private writes; config
   directories/files use 750/640 and Docker gets the host numeric config group.
   Directory selectors must be absolute and must not resolve to filesystem root.
+  Persistent configuration must stay outside replaceable `bridge/` and `venv/`
+  trees. Validate the complete layout before privileged work or file mutation.
   Detect brokers from parsed base/drop-in TOML and allocate unused custom
   broker names, so named overlays cannot replace an existing broker by accident.
   Owner and IATA edits operate on parsed tables and preserve unrelated values,
   including TOML date/time scalars; serialization normalizes formatting/comments.
   Stage the bridge package before retiring its destination; `LOCAL_INSTALL`
   may refer to the installation directory itself or an alias of it.
+  Installer temporary directories and snapshots must stay outside both source
+  and destination package trees and the replaceable venv, even when `TMPDIR`
+  points inside them. Reject local source roots inside the installed package
+  or venv before mutation; a source at the application root remains supported.
   Parse layered serial TOML for Docker mappings and include all present
   candidates; validate configuration before removing an existing container.
   Preserve bootstrap argv and explicitly supported environment selectors
@@ -174,6 +181,8 @@ See `config.toml.example` for the full reference with all options and defaults.
   Backups use unique mode-600 files; backup failure stops configuration
   removal. Read uninstaller prompts from the controlling terminal when piped,
   decline actions on EOF, and match exact Docker container/image names.
+  If retained configuration is inside the application directory, preserve that
+  directory too and report which files remain.
 - **Config access:** `state.config` dict with `state.config.get('section', {}).get('key', default)`. Broker configs accessed via `topics.get_broker_config(state, broker_idx)`.
 - **Version:** `__version__` is defined at the top of `mctomqtt.py`. The `.version_info` JSON file (created by installer) appends git hash info. Version is passed to `MeshCoreBridge(config, debug, version)`.
 - **Dependency injection:** All external dependencies (serial, MQTT, auth) are abstracted behind ABCs. Tests inject fakes via `make_test_state()` from `tests/fakes.py`.

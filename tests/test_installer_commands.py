@@ -149,13 +149,14 @@ def test_uninstaller_rejects_relative_directory_selectors_before_prompting(selec
     assert "This will remove" not in result.stdout
 
 
-def _uninstaller_environment(tmp_path, *, fail_backup=False):
+def _uninstaller_environment(tmp_path, *, fail_backup=False, remove_files=False):
     binaries = tmp_path / "fake-bin"
     binaries.mkdir()
     commands = tmp_path / "uninstall-commands.jsonl"
     sudo = binaries / "sudo"
     sudo.write_text(
         f"#!{sys.executable}\nimport json, os, shutil, sys\n"
+        "from pathlib import Path\n"
         "arguments=sys.argv[1:]\n"
         "with open(os.environ['COMMAND_RECORD'], 'a') as output:\n"
         "    output.write(json.dumps(arguments) + '\\n')\n"
@@ -163,6 +164,14 @@ def _uninstaller_environment(tmp_path, *, fail_backup=False):
         "if arguments[0] == 'cat':\n"
         "    if os.environ.get('FAIL_BACKUP'): raise SystemExit(1)\n"
         "    with open(arguments[-1], 'rb') as source: sys.stdout.buffer.write(source.read())\n"
+        "if arguments[0] == 'rm' and os.environ.get('TEST_REMOVAL_ROOT'):\n"
+        "    allowed_root = Path(os.environ['TEST_REMOVAL_ROOT']).resolve()\n"
+        "    for argument in arguments[1:]:\n"
+        "        if argument.startswith('-'): continue\n"
+        "        target = Path(argument)\n"
+        "        assert allowed_root in target.resolve().parents, 'removal outside test files'\n"
+        "        if target.is_symlink() or target.is_file(): target.unlink()\n"
+        "        elif target.is_dir(): shutil.rmtree(target)\n"
     )
     sudo.chmod(0o755)
     date = binaries / "date"
@@ -174,7 +183,56 @@ def _uninstaller_environment(tmp_path, *, fail_backup=False):
                        MCTOMQTT_INSTALL_DIR=str(tmp_path / "unused-application"))
     if fail_backup:
         environment["FAIL_BACKUP"] = "1"
+    if remove_files:
+        environment["TEST_REMOVAL_ROOT"] = str(tmp_path.resolve())
     return environment, commands
+
+
+@pytest.mark.parametrize('placement', ['nested', 'same', 'config-alias', 'app-alias', 'sibling-prefix'])
+def test_uninstaller_preserves_kept_configuration_inside_application_directory(tmp_path, placement):
+    environment, commands = _uninstaller_environment(tmp_path, remove_files=True)
+    app = tmp_path / 'application'
+    app.mkdir()
+    (app / 'mctomqtt.py').write_text('# installed application\n')
+    config = app if placement == 'same' else (
+        tmp_path / 'application settings' if placement == 'sibling-prefix' else app / 'private settings')
+    (config / 'config.d').mkdir(parents=True)
+    user_config = config / 'config.d/99-user.toml'
+    contents = '[general]\niata="SEA"\n'
+    user_config.write_text(contents)
+    selected_app, selected_config = app, config
+    if placement == 'config-alias':
+        selected_config = tmp_path / 'selected config'
+        selected_config.symlink_to(config, target_is_directory=True)
+    elif placement == 'app-alias':
+        selected_app = tmp_path / 'selected app'
+        selected_app.symlink_to(app, target_is_directory=True)
+    environment.update(MCTOMQTT_INSTALL_DIR=str(selected_app),
+                       MCTOMQTT_CONFIG_DIR=str(selected_config),
+                       TEST_SERVICE_FILE=str(tmp_path / 'missing.service'),
+                       TEST_LAUNCHD_FILE=str(tmp_path / 'missing.plist'))
+    docker = tmp_path / 'fake-bin/docker'
+    docker.write_text('#!/bin/sh\nexit 1\n')
+    docker.chmod(0o755)
+    source = (ROOT / 'uninstall.sh').read_text()
+    script = source[:source.index('# Run main')]
+    script += '\nSYSTEMD_UNIT="$TEST_SERVICE_FILE"\nLAUNCHD_PLIST="$TEST_LAUNCHD_FILE"\nmain\n'
+    result = subprocess.run(['bash', '-c', script], input='\ny\nn\nn\n',
+                            env=environment, capture_output=True, text=True,
+                            start_new_session=True, timeout=5)
+
+    assert result.returncode == 0, result.stderr
+    assert user_config.read_text() == contents
+    keep_application = placement != 'sibling-prefix'
+    assert app.is_dir() is keep_application
+    if keep_application:
+        assert 'Application and configuration directories kept' in result.stdout
+        assert str(selected_app) in result.stdout
+        assert str(selected_config) in result.stdout
+        assert not commands.exists()
+    else:
+        logged = [json.loads(line) for line in commands.read_text().splitlines()]
+        assert logged == [['rm', '-rf', '--', str(selected_app)]]
 
 
 @pytest.mark.parametrize("existing_backup", ["file", "symlink"])

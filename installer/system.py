@@ -298,12 +298,61 @@ def chown_recursive(path: str, user: str, group: str) -> None:
 # File download
 # ---------------------------------------------------------------------------
 
+def validate_local_source(install_dir: str, local_install: str) -> None:
+    """Reject selected sources inside application trees replaced by installers."""
+    if not local_install:
+        return
+    source = Path(local_install).resolve()
+    for name in ("bridge", "venv"):
+        replaceable = (Path(install_dir) / name).resolve()
+        if source.is_relative_to(replaceable):
+            raise ValueError(
+                f"Local installation source must not be inside replaceable installation directory: {replaceable}"
+            )
+
+
+def _create_package_staging_dir(repo_dir: str, install_dir: str,
+                                preferred_dir: str, prefix: str) -> str:
+    """Create staging outside package trees that may be copied or replaced."""
+    trees = [(Path(install_dir) / name).resolve() for name in ("bridge", "venv")]
+    candidates = [Path(preferred_dir), Path(install_dir), Path(install_dir).parent]
+    if repo_dir:
+        source = Path(repo_dir) / "bridge"
+        trees.append(source.resolve())
+        candidates.extend((source.parent, source.parent.parent))
+    seen: set[Path] = set()
+    creation_error: OSError | None = None
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not candidate.is_dir() or any(resolved.is_relative_to(tree) for tree in trees):
+            continue
+        try:
+            return tempfile.mkdtemp(prefix=prefix, dir=candidate)
+        except OSError as error:
+            creation_error = error
+    if creation_error is not None:
+        raise creation_error
+    raise ValueError("No staging directory is available outside source and destination packages")
+
+
+def create_installer_staging_dir(install_dir: str, repo_dir: str = "") -> str:
+    """Honor TMPDIR while keeping prepared assets outside replaceable trees."""
+    validate_local_source(install_dir, repo_dir)
+    return _create_package_staging_dir(repo_dir, install_dir, tempfile.gettempdir(),
+                                       "mctomqtt-")
+
+
 def install_bridge_package(repo_dir: str, install_dir: str, staging_dir: str) -> None:
     """Snapshot the source package before retiring a possibly identical target."""
+    validate_local_source(install_dir, repo_dir)
     source = Path(repo_dir) / "bridge"
     if not source.is_dir():
         return
-    snapshot = Path(tempfile.mkdtemp(prefix=".bridge-source-", dir=staging_dir))
+    snapshot = Path(_create_package_staging_dir(repo_dir, install_dir, staging_dir,
+                                               ".bridge-source-"))
     try:
         shutil.copytree(source, snapshot, dirs_exist_ok=True)
         destination = Path(install_dir) / "bridge"
@@ -496,9 +545,8 @@ def create_system_user(svc_user: str, install_dir: str) -> None:
 
 def set_permissions(install_dir: str, config_dir: str, svc_user: str) -> None:
     """Set directory ownership and permissions."""
-    from .config import validate_config_directory, validate_install_directory
-    validate_install_directory(install_dir)
-    validate_config_directory(config_dir)
+    from .config import validate_install_layout
+    validate_install_layout(install_dir, config_dir)
     config_d = Path(config_dir) / "config.d"
     # /opt/mctomqtt owned by svc_user:svc_user
     chown_recursive(install_dir, svc_user, svc_user)

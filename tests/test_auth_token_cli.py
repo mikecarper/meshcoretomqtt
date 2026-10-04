@@ -65,3 +65,13 @@ def test_invalid_inline_key_reports_error_without_echoing_key(tmp_path):
     assert result.returncode == 1
     assert 'Failed to generate auth token' in result.stdout
     assert invalid_key not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('private_input', [PRIVATE_KEY[:-2], 'g' + PRIVATE_KEY[1:-2]],
+                         ids=['truncated-hex', 'malformed-truncated'])
+def test_truncated_inline_key_reports_error_without_echoing_key(tmp_path, private_input):
+    assert len(private_input) == 126
+    result = run_cli(private_input, tmp_path)
+    assert result.returncode == 1
+    assert 'Error:' in result.stdout
+    assert private_input not in result.stdout + result.stderr

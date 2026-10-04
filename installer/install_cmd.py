@@ -23,12 +23,13 @@ from .config import (
     user_config_path,
     write_private_config,
     _toml_dumps,
-    validate_config_directory,
-    validate_install_directory,
+    validate_install_layout,
 )
 from .migrate_cmd import run_migrate
 from .system import (
     create_system_user,
+    create_installer_staging_dir,
+    validate_local_source,
     create_venv,
     create_version_info,
     detect_system_type_native,
@@ -59,7 +60,9 @@ if TYPE_CHECKING:
 
 def run_install(ctx: InstallerContext) -> None:
     """Run a fresh installation."""
-    tmp_dir = tempfile.mkdtemp()
+    validate_install_layout(ctx.install_dir, ctx.config_dir)
+    validate_local_source(ctx.install_dir, ctx.local_install)
+    tmp_dir = create_installer_staging_dir(ctx.install_dir, ctx.local_install)
     try:
         _do_install(ctx, tmp_dir)
     finally:
@@ -67,8 +70,8 @@ def run_install(ctx: InstallerContext) -> None:
 
 
 def _do_install(ctx: InstallerContext, tmp_dir: str) -> None:
-    validate_install_directory(ctx.install_dir)
-    validate_config_directory(ctx.config_dir)
+    validate_install_layout(ctx.install_dir, ctx.config_dir)
+    validate_local_source(ctx.install_dir, ctx.local_install)
     # Download repo archive (or use local install path)
     if ctx.local_install:
         repo_dir = ctx.local_install

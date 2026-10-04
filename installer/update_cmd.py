@@ -6,7 +6,6 @@ import os
 import platform
 import re
 import shutil
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,14 +20,15 @@ from .config import (
     token_preset_brokers,
     user_config_path,
     write_private_config,
-    validate_config_directory,
-    validate_install_directory,
+    validate_install_layout,
 )
 from .system import (
     LOCAL_IMAGE,
     check_service_health,
     cleanup_legacy_nvm,
     create_system_user,
+    create_installer_staging_dir,
+    validate_local_source,
     create_version_info,
     create_venv,
     detect_service_user,
@@ -58,8 +58,8 @@ if TYPE_CHECKING:
 
 def run_update(ctx: InstallerContext) -> None:
     """Update an existing installation."""
-    validate_install_directory(ctx.install_dir)
-    validate_config_directory(ctx.config_dir)
+    validate_install_layout(ctx.install_dir, ctx.config_dir)
+    validate_local_source(ctx.install_dir, ctx.local_install)
 
     # Verify installation exists
     if not Path(ctx.install_dir, "mctomqtt.py").exists():
@@ -68,7 +68,7 @@ def run_update(ctx: InstallerContext) -> None:
         raise SystemExit(1)
 
     # Create temp directory for downloads
-    tmp_dir = tempfile.mkdtemp()
+    tmp_dir = create_installer_staging_dir(ctx.install_dir, ctx.local_install)
     try:
         _do_update(ctx, tmp_dir)
     finally:
@@ -76,8 +76,8 @@ def run_update(ctx: InstallerContext) -> None:
 
 
 def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
-    validate_install_directory(ctx.install_dir)
-    validate_config_directory(ctx.config_dir)
+    validate_install_layout(ctx.install_dir, ctx.config_dir)
+    validate_local_source(ctx.install_dir, ctx.local_install)
     # Download repo archive (or use local install path)
     if ctx.local_install:
         repo_dir = ctx.local_install

@@ -146,7 +146,7 @@
       serialPorts = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = ["/dev/ttyACM0"];
-        description = "Serial ports to listen on (will be available to the mctomqtt user)";
+        description = "Optional serial connection candidates, tried by the application; missing candidates do not block the service";
         example = ["/dev/ttyACM0" "/dev/ttyACM1"];
       };
 
@@ -226,6 +226,8 @@
       systemd.services.mctomqtt = {
         description = "MeshCore to MQTT Bridge";
         wantedBy = ["multi-user.target"];
+        wants = ["network-online.target"];
+        after = ["network-online.target"];
 
         serviceConfig = {
           Type = "notify";
@@ -255,18 +257,12 @@
           PrivateTmp = true;
           ProtectSystem = "strict";
           ProtectHome = true;
-          ReadWritePaths =
-            [
-              "/var/lib/mctomqtt"
-              "/var/cache/mctomqtt"
-              "/var/log/mctomqtt"
-            ]
-            ++ cfg.serialPorts;
+          ReadWritePaths = [
+            "/var/lib/mctomqtt"
+            "/var/cache/mctomqtt"
+            "/var/log/mctomqtt"
+          ];
         };
-
-        # Ensure serial devices are available
-        requires = map (port: "dev-${lib.replaceStrings ["/dev/"] [""] port}.device") cfg.serialPorts;
-        after = ["network.target"] ++ map (port: "dev-${lib.replaceStrings ["/dev/"] [""] port}.device") cfg.serialPorts;
       };
     };
   };

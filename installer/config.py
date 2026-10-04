@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import re
 import shutil
+import stat
 import tempfile
 import tomllib
 import time
@@ -100,9 +102,59 @@ def validate_email(email: str) -> str | None:
 
 def toml_escape(val: str) -> str:
     """Escape a string value for use in a TOML quoted string."""
-    val = val.replace("\\", "\\\\")
-    val = val.replace('"', '\\"')
-    return val
+    escapes = {"\\": "\\\\", '"': '\\"', "\b": "\\b", "\t": "\\t",
+               "\n": "\\n", "\f": "\\f", "\r": "\\r"}
+    return "".join(escapes.get(char, f"\\u{ord(char):04x}" if ord(char) < 32
+                              or ord(char) == 127 else char) for char in val)
+
+
+def write_private_config(path: str | Path, content: str, *, overwrite: bool = True) -> None:
+    """Validate and atomically install private TOML, preserving existing ownership."""
+    tomllib.loads(content)
+    dest = Path(path)
+    existing = None
+    try:
+        existing = dest.lstat()
+    except FileNotFoundError:
+        pass
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise ValueError(f"Configuration target is not a regular file: {dest}")
+    if existing is not None and not overwrite:
+        raise FileExistsError(f"Configuration already exists: {dest}")
+    fd, temporary = tempfile.mkstemp(prefix=f".{dest.name}.", dir=dest.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            os.fchmod(output.fileno(), 0o640)
+            if existing is not None:
+                os.fchown(output.fileno(), existing.st_uid, existing.st_gid)
+            else:
+                os.fchown(output.fileno(), os.getuid(), dest.parent.stat().st_gid)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        if overwrite:
+            os.replace(temporary, dest)
+        else:
+            # A concurrent creator must not lose its configuration.
+            os.link(temporary, dest)
+            os.unlink(temporary)
+        directory = os.open(dest.parent, os.O_RDONLY)
+        try:
+            try:
+                os.fsync(directory)
+            except OSError as error:
+                if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+                    raise
+        finally:
+            os.close(directory)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _append_private_config(path: str | Path, block: str) -> None:
+    dest = Path(path)
+    content = dest.read_text() if dest.exists() else ""
+    write_private_config(dest, content + block)
 
 
 def _companions_to_toml_array(csv: str) -> str:
@@ -134,7 +186,7 @@ ports = ["{toml_escape(serial_device)}"]
 repo = "{toml_escape(repo)}"
 branch = "{toml_escape(branch)}"
 """
-    Path(dest).write_text(content)
+    write_private_config(dest, content)
 
 
 def append_disabled_broker_toml(dest: str, broker_name: str) -> None:
@@ -144,8 +196,7 @@ def append_disabled_broker_toml(dest: str, broker_name: str) -> None:
 name = "{toml_escape(broker_name)}"
 enabled = false
 """
-    with open(dest, "a") as f:
-        f.write(block)
+    _append_private_config(dest, block)
 
 
 def append_letsmesh_broker_toml(
@@ -178,8 +229,7 @@ audience = "{toml_escape(audience)}"
 owner = "{toml_escape(owner)}"
 email = "{toml_escape(email)}"
 """
-    with open(dest, "a") as f:
-        f.write(block)
+    _append_private_config(dest, block)
 
 
 def append_custom_broker_toml(
@@ -228,8 +278,7 @@ def append_custom_broker_toml(
             lines.append(f'email = "{toml_escape(email)}"')
 
     lines.append("")
-    with open(dest, "a") as f:
-        f.write("\n".join(lines))
+    _append_private_config(dest, "\n".join(lines))
 
 
 def append_remote_serial_toml(dest: str, companions_csv: str) -> None:
@@ -242,8 +291,7 @@ def append_remote_serial_toml(dest: str, companions_csv: str) -> None:
 enabled = {enabled}
 allowed_companions = {companions_array}
 """
-    with open(dest, "a") as f:
-        f.write(block)
+    _append_private_config(dest, block)
 
 
 def append_token_owner_overrides_toml(
@@ -271,8 +319,7 @@ def append_token_owner_overrides_toml(
             lines.append(f'email = "{toml_escape(email)}"')
 
     lines.append("")
-    with open(dest, "a") as f:
-        f.write("\n".join(lines))
+    _append_private_config(dest, "\n".join(lines))
 
 
 def _rewrite_token_owner_overrides_toml(
@@ -355,7 +402,7 @@ def _load_user_toml(path: str | Path) -> dict[str, Any]:
 
 def _write_user_toml(path: str | Path, data: dict[str, Any]) -> None:
     """Serialize a user TOML document, prepending the standard header."""
-    Path(path).write_text(USER_CONFIG_HEADER + _toml_dumps(data))
+    write_private_config(path, USER_CONFIG_HEADER + _toml_dumps(data))
 
 
 _BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -552,7 +599,7 @@ def copy_preset_to_config(source: str | Path, config_dir: str | Path) -> Path:
     dest = preset_dest_path(config_dir, source_path.name)
     validate_preset_toml(source_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_path, dest)
+    write_private_config(dest, source_path.read_text())
     return dest
 
 
@@ -577,7 +624,7 @@ def import_preset_to_config(source: str, config_dir: str | Path) -> Path:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 tmp_path.write_bytes(resp.read())
             validate_preset_toml(tmp_path)
-            shutil.copy2(tmp_path, dest)
+            write_private_config(dest, tmp_path.read_text())
         finally:
             tmp_path.unlink(missing_ok=True)
         return dest
@@ -1081,7 +1128,7 @@ def configure_mqtt_brokers(ctx: InstallerContext) -> None:
     if platform.system() != "Darwin" and ctx.svc_user:
         import shutil as _shutil
         _shutil.chown(user_toml, "root", ctx.svc_user)
-        os.chmod(user_toml, 0o644)
+        os.chmod(user_toml, 0o640)
 
 
 def _configure_iata_simple(user_toml: str) -> None:
@@ -1268,6 +1315,24 @@ def _config_dir_has_broker(config_dir: str) -> bool:
 # Update owner info for existing config
 # ---------------------------------------------------------------------------
 
+def _replace_owner_fields(content: str, owner: str, email: str) -> str:
+    """Replace explicit token-auth owners, preserving preset-only overrides."""
+    blocks = re.split(r'(?=^\[\[broker\]\]\s*$)', content, flags=re.MULTILINE)
+    for index, block in enumerate(blocks):
+        if not block.startswith("[[broker]]"):
+            continue
+        parsed = tomllib.loads(block)
+        if parsed.get("broker", [{}])[0].get("auth", {}).get("method") != "token":
+            continue
+        for key, value in (("owner", owner), ("email", email)):
+            if value:
+                block = re.sub(rf'^({key}\s*=\s*).*$',
+                               lambda match, v=value: match.group(1) + '"' + toml_escape(v) + '"',
+                               block, flags=re.MULTILINE)
+        blocks[index] = block
+    return "".join(blocks)
+
+
 def update_owner_info(config_dir: str) -> None:
     """Update owner public key and email for existing token-auth brokers."""
     user_toml = str(migrate_user_config_filename(config_dir))
@@ -1287,6 +1352,7 @@ def update_owner_info(config_dir: str) -> None:
 
     if has_token_presets:
         _configure_token_preset_overrides(config_dir)
+        content = Path(user_toml).read_text()
         if 'method = "token"' not in content:
             return
 
@@ -1318,11 +1384,8 @@ def update_owner_info(config_dir: str) -> None:
     shutil.copy2(user_toml, f"{user_toml}.backup-{timestamp}")
 
     # Update owner and email
-    if new_owner:
-        content = re.sub(r'^(owner\s*=\s*).*$', f'\\1"{new_owner}"', content, flags=re.MULTILINE)
-    if new_email:
-        content = re.sub(r'^(email\s*=\s*).*$', f'\\1"{new_email}"', content, flags=re.MULTILINE)
-    Path(user_toml).write_text(content)
+    content = _replace_owner_fields(content, new_owner, new_email)
+    write_private_config(user_toml, content)
 
     # Prompt for remote serial companions
     existing_companions = _read_remote_serial_companions(user_toml)
@@ -1365,8 +1428,10 @@ def _read_existing_iata(user_toml: str) -> str:
 def _update_iata_in_file(user_toml: str, iata: str) -> None:
     """Update the iata value in a user TOML."""
     content = Path(user_toml).read_text()
-    content = re.sub(r'^(iata\s*=\s*).*$', f'\\1"{iata}"', content, flags=re.MULTILINE)
-    Path(user_toml).write_text(content)
+    content = re.sub(r'^(iata\s*=\s*).*$',
+                     lambda match: match.group(1) + f'"{toml_escape(iata)}"',
+                     content, flags=re.MULTILINE)
+    write_private_config(user_toml, content)
 
 
 # Need platform for the import in configure_mqtt_brokers

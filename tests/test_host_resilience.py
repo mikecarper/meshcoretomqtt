@@ -242,7 +242,7 @@ def test_disabled_serial_watchdog_does_not_reconnect_quiet_device():
     state.mqtt_manager = LoopManager(healthy=False)
     health = LoopHealth()
 
-    def unexpected_connector(config):
+    def unexpected_connector(config, *, expected_public_key=None):
         raise AssertionError('Disabled watchdog reconnected quiet device')
 
     def finish_loop(delay):
@@ -288,7 +288,8 @@ def test_closed_serial_reopens_even_with_idle_watchdog_disabled():
     connections = []
     ticks = []
 
-    def connector(config):
+    def connector(config, *, expected_public_key=None):
+        assert expected_public_key == state.repeater_pub_key
         connections.append(config)
         return new
 
@@ -306,7 +307,7 @@ def test_closed_serial_reopens_even_with_idle_watchdog_disabled():
 def test_reconnect_rejects_wrong_or_unverifiable_radio(public_key):
     device = FakeSerialConnection(pubkey=public_key)
     state = make_test_state(repeater_pub_key='AA' * 32)
-    assert _reconnect_device(state, lambda config: device) is None
+    assert _reconnect_device(state, lambda config, **kwargs: device) is None
     assert not device.is_open
 
 
@@ -318,7 +319,7 @@ def test_reconnect_verification_exception_closes_new_session():
     device = FailingDevice()
     state = make_test_state(repeater_pub_key='AA' * 32)
     with pytest.raises(OSError):
-        _reconnect_device(state, lambda config: device)
+        _reconnect_device(state, lambda config, **kwargs: device)
     assert not device.is_open
 
 

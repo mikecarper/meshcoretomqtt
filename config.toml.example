@@ -9,6 +9,9 @@
 #   3. /etc/mctomqtt/config.d/99-user.toml (local overrides, loaded last)
 #
 # Put your customizations in /etc/mctomqtt/config.d/99-user.toml
+# MCTOMQTT_CONFIG_DIR selects a different base/config.d directory when set.
+# Named [[broker]] blocks merge recursively, including repeats in one file;
+# later fields win and each name creates one connection.
 #
 # The --config flag bypasses default loading entirely. Multiple --config flags
 # are supported; files are loaded in order, each overlaying the previous.
@@ -27,6 +30,8 @@ sync_time = true
 [serial]
 # Serial ports to try connecting to (first successful port is used).
 # Prefer /dev/serial/by-id/... on Linux; only this bridge should open the port.
+# Docker installs/updates map candidates present when the container is created.
+# Recreate the container to map a candidate added later.
 ports = ["/dev/ttyACM0"]
 
 # Serial baud rate
@@ -69,9 +74,9 @@ raw = "meshcore/{IATA}/{PUBLIC_KEY}/raw"
 # Security model:
 #   - Commands must be signed with an Ed25519 private key
 #   - Only companions in the allowlist can send commands
-#   - Each command JWT has a 30-second expiry (checked against system clock)
-#   - Nonces prevent replay attacks
-#   - Responses are signed by the node's private key for verification
+#   - Command JWTs require a finite expiry (the web UI normally uses 30 seconds)
+#   - Nonces are claimed atomically and retained until at least JWT expiry
+#   - Signed responses go only to the requesting broker, using its IATA
 #
 # Note: Ensure your system clock is synchronized (NTP) for JWT expiry checks.
 enabled = false
@@ -79,8 +84,12 @@ enabled = false
 # Companion public keys authorized to send commands (64 hex chars each)
 allowed_companions = []
 
-# Nonce TTL in seconds - how long to track nonces for replay protection
+# Minimum nonce retention in seconds (1..31536000); longer JWT expiry wins.
 nonce_ttl = 120
+
+# Bound replay cache entries (1..65536). Reject new commands when full rather
+# than evicting nonces belonging to still-valid JWTs.
+max_pending_nonces = 4096
 
 # Command timeout in seconds - how long to wait for serial response
 command_timeout = 10

@@ -23,20 +23,17 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 
 def merge_broker_lists(base_brokers: list[dict[str, Any]], override_brokers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge broker lists by name. Override brokers replace base brokers with the same name."""
-    if not override_brokers:
-        return base_brokers
-    if not base_brokers:
-        return override_brokers
+    """Deep merge named brokers in encounter order, including new overlay names."""
+    result: list[dict[str, Any]] = []
+    names: dict[str, int] = {}
 
-    result = list(base_brokers)
-    base_names = {b.get('name', ''): i for i, b in enumerate(result)}
-
-    for broker in override_brokers:
+    for broker in (*base_brokers, *override_brokers):
         name = broker.get('name', '')
-        if name and name in base_names:
-            result[base_names[name]] = deep_merge(result[base_names[name]], broker)
+        if name and name in names:
+            result[names[name]] = deep_merge(result[names[name]], broker)
         else:
+            if name:
+                names[name] = len(result)
             result.append(broker)
 
     return result
@@ -44,9 +41,9 @@ def merge_broker_lists(base_brokers: list[dict[str, Any]], override_brokers: lis
 
 def _apply_override(config: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Merge an override dict into config, handling broker lists specially."""
-    override_brokers = override.pop('broker', None)
+    override_brokers = override.get('broker')
     config_brokers = config.get('broker', [])
-    config = deep_merge(config, override)
+    config = deep_merge(config, {key: value for key, value in override.items() if key != 'broker'})
     if override_brokers is not None:
         config['broker'] = merge_broker_lists(config_brokers, override_brokers)
     return config
@@ -73,12 +70,12 @@ def load_config(config_paths: list[str] | None = None) -> dict[str, Any]:
     """Load and merge TOML configuration.
 
     When no --config paths are provided (default):
-      1. Load base config from /etc/mctomqtt/config.toml
-      2. Overlay files from /etc/mctomqtt/config.d/*.toml (alphabetical)
+      1. Load base config.toml from MCTOMQTT_CONFIG_DIR (/etc/mctomqtt if unset)
+      2. Overlay that directory's config.d/*.toml files (alphabetical)
 
     When --config paths are provided:
       Load only those files in order, each overlaying the previous.
-      Default search paths and config.d directories are skipped.
+      Environment/default search paths and config.d directories are skipped.
     """
     if config_paths:
         config: dict = {}
@@ -93,15 +90,16 @@ def load_config(config_paths: list[str] | None = None) -> dict[str, Any]:
 
     # Default: load system config
     config = {}
-    base_path = '/etc/mctomqtt/config.toml'
+    config_dir = Path(os.environ.get('MCTOMQTT_CONFIG_DIR') or '/etc/mctomqtt')
+    base_path = config_dir / 'config.toml'
     if os.path.exists(base_path):
-        config = _load_toml(base_path)
+        config = _apply_override(config, _load_toml(base_path))
         logger.info(f"Loaded base config from {base_path}")
     else:
         logger.warning(f"Base config not found at {base_path}, using defaults")
 
     # Load drop-in overrides
-    config = _load_config_dir(config, Path('/etc/mctomqtt/config.d'))
+    config = _load_config_dir(config, config_dir / 'config.d')
 
     return config
 

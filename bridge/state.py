@@ -85,7 +85,17 @@ class BridgeState:
             ['get prv.key', 'set prv.key', 'erase', 'password']
         )
         self.remote_serial_nonce_ttl: int = remote_cfg.get('nonce_ttl', 120)
-        self.remote_serial_nonces: dict[str, int] = {}
+        self.remote_serial_max_pending_nonces: int = remote_cfg.get('max_pending_nonces', 4096)
+        for label, value, maximum in (
+            ('nonce_ttl', self.remote_serial_nonce_ttl, 31536000),
+            ('max_pending_nonces', self.remote_serial_max_pending_nonces, 65536),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+                raise ValueError(f"remote_serial.{label} must be an integer from 1 to {maximum}")
+        # Values are retention deadlines, not first-seen timestamps. Keep every
+        # accepted nonce until its JWT expires, even when nonce_ttl is shorter.
+        self.remote_serial_nonces: dict[str, float] = {}
+        self.remote_serial_nonce_lock = threading.RLock()
         self.remote_serial_command_timeout: int = remote_cfg.get('command_timeout', 10)
 
         # Statistics tracking

@@ -16,7 +16,7 @@ from . import serial_connection
 from . import message_parser
 from . import background
 from .auth_provider import MeshCoreAuthProvider
-from .mqtt_publish import publish_status
+from .mqtt_publish import publish_shutdown_status
 from .service_health import ServiceHealth
 
 if TYPE_CHECKING:
@@ -254,7 +254,7 @@ def _run_main_loop(state: BridgeState, health: ServiceHealth, *,
 
 def _reconnect_device(state: BridgeState, connector):
     """Never attribute a different radio's packets to the startup identity."""
-    device = connector(state.config)
+    device = connector(state.config, expected_public_key=state.repeater_pub_key)
     if device is None:
         return None
     if state.repeater_pub_key:
@@ -276,20 +276,28 @@ def _cleanup(state: BridgeState, stats_thread: threading.Thread | None) -> None:
     """Shut down background threads, publish offline status, and close connections."""
     logger.info("Cleaning up...")
     state.should_exit = True
+    if state.mqtt_manager:
+        begin_shutdown = getattr(state.mqtt_manager, 'begin_shutdown', None)
+        if begin_shutdown is not None:
+            begin_shutdown()
 
     # Wait for stats thread to finish
     if stats_thread is not None and stats_thread.is_alive():
         stats_thread.join(timeout=5)
 
-    # Publish offline status before disconnecting
-    for mqtt_info in state.mqtt_clients:
-        if mqtt_info.get('connected'):
-            try:
-                publish_status(state, "offline",
-                               client=mqtt_info['client'],
-                               broker_idx=mqtt_info['broker_idx'])
-            except Exception:
-                pass
+    # Bound the combined PUBACK waits even with many brokers. Unconfirmed
+    # transports abort before manager.stop(), preserving the broker's LWT.
+    deadline = time.monotonic() + 5.0
+    for mqtt_info in list(state.mqtt_clients):
+        client = mqtt_info.get('client')
+        if client is not None:
+            # A pending CONNACK can establish a broker-side session even when
+            # our slot is not connected. Abort it without DISCONNECT so its
+            # offline will is not suppressed during cleanup.
+            timeout = (min(2.0, max(0.0, deadline - time.monotonic()))
+                       if mqtt_info.get('connected') else 0.0)
+            mqtt_info['shutdown_confirmed'] = publish_shutdown_status(
+                state, client, mqtt_info['broker_idx'], timeout=timeout)
 
     # The lifecycle owner retires clients and invalidates stale callbacks.
     if state.mqtt_manager:

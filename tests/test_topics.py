@@ -91,6 +91,36 @@ class TestSanitizeClientId:
         result = sanitize_client_id("Node", prefix="custom_")
         assert result == "custom_Node"
 
+    def test_long_prefix_cannot_remove_node_identity(self):
+        prefix = "meshcore_my_remote_site_"
+        first = sanitize_client_id("AA" * 32, prefix)
+        second = sanitize_client_id("BB" * 32, prefix)
+        assert first != second
+        assert len(first) <= 23
+        assert len(second) <= 23
+        assert first == sanitize_client_id("AA" * 32, prefix)
+
+    def test_full_identity_not_only_public_key_prefix_is_hashed(self):
+        first = sanitize_client_id("AA" * 32)
+        second = sanitize_client_id("AA" * 31 + "BB")
+        assert first != second
+
+    def test_complete_prefix_namespace_is_in_identity_digest(self):
+        first = sanitize_client_id('AA' * 32, 'remote_site_namespace_one_')
+        second = sanitize_client_id('AA' * 32, 'remote_site_namespace_two_')
+        assert first[:7] == second[:7] == 'remote_'
+        assert first != second
+
+    @pytest.mark.parametrize('prefix', ['', 'long-' * 20, '@#$%_' * 20])
+    def test_long_ids_and_broker_suffix_stay_portable(self, prefix):
+        ids = [sanitize_client_id('AA' * 32, prefix, suffix=f'_{index}')
+               for index in (0, 1, 999999)]
+        assert len(set(ids)) == len(ids)
+        for client_id in ids:
+            assert 1 <= len(client_id) <= 23
+            assert all(char.isascii() and (char.isalnum() or char in '_-')
+                       for char in client_id)
+
 
 class TestGetBrokerConfig:
     def test_valid_index(self):

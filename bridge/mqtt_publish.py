@@ -104,7 +104,7 @@ def publish_status(
     client: BrokerClient | None = None,
     broker_idx: int | None = None,
 ) -> None:
-    """Publish status message (NOT retained)."""
+    """Publish periodic status without retaining it; shutdown uses confirmation."""
     status_msg = build_status_message(state, status, include_stats=True)
     
     if client:
@@ -113,3 +113,47 @@ def publish_status(
         safe_publish(state, "status", json.dumps(status_msg), retain=False)
 
     logger.debug(f"Published status: {status}")
+
+
+def publish_shutdown_status(
+    state: BridgeState, client: BrokerClient, broker_idx: int, timeout: float = 2.0,
+) -> bool:
+    """Confirm offline before graceful disconnect, or preserve the broker LWT.
+
+    Shutdown is the one low-volume path where QoS 1 must not be downgraded.
+    A PUBACK proves the retained update was accepted, unlike QoS 0 handoff.
+    If confirmation fails, close without DISCONNECT so the offline LWT remains
+    the fallback. Custom clients without confirmation get a best-effort send;
+    without abort support they cannot guarantee this transport-level fallback.
+    """
+    broker = topics.get_broker_config(state, broker_idx)
+    topic = topics.get_topic(state, 'status', broker_idx)
+    confirmed = False
+    try:
+        if topic and timeout > 0:
+            payload = json.dumps(build_status_message(state, 'offline'))
+            retain = broker.get('retain', True)
+            qos = max(1, min(2, broker.get('qos', 0)))
+            publish_confirmed = getattr(client, 'publish_confirmed', None)
+            if publish_confirmed is not None:
+                confirmed = bool(publish_confirmed(
+                    topic, payload, qos=qos, retain=retain, timeout=timeout,
+                ))
+            else:
+                client.publish(topic, payload, qos=qos, retain=retain)
+    except Exception:
+        logger.warning('[%s] Could not confirm offline status', broker.get('name', broker_idx), exc_info=True)
+    if not confirmed:
+        abort = getattr(client, 'abort', None)
+        if abort is not None:
+            try:
+                abort()
+                logger.warning('[%s] Offline status unconfirmed; relying on broker LWT',
+                               broker.get('name', broker_idx))
+            except Exception:
+                logger.warning('[%s] Could not abort unconfirmed shutdown transport',
+                               broker.get('name', broker_idx), exc_info=True)
+        else:
+            logger.warning('[%s] Offline status unconfirmed; custom client lacks abort support',
+                           broker.get('name', broker_idx))
+    return confirmed

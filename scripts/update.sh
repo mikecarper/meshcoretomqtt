@@ -4,6 +4,15 @@
 # Downloads the Python installer package and runs `python3 -m installer update`
 # ============================================================================
 set -e
+ORIGINAL_ARGS=("$@")
+
+for selector in MCTOMQTT_INSTALL_DIR MCTOMQTT_CONFIG_DIR; do
+    selected_dir="${!selector:-}"
+    if [[ -n "$selected_dir" && "$selected_dir" != /* ]]; then
+        echo "Error: $selector must be an absolute path." >&2
+        exit 1
+    fi
+done
 
 REPO="${MCTOMQTT_REPO:-Cisien/meshcoretomqtt}"
 BRANCH="${MCTOMQTT_BRANCH:-main}"
@@ -17,20 +26,20 @@ if [ ! -f "$USER_TOML" ] && [ -f "$CONFIG_DIR/config.d/00-user.toml" ]; then
     USER_TOML="$CONFIG_DIR/config.d/00-user.toml"
 fi
 if [ -f "$USER_TOML" ]; then
-    _repo=$(python3 -c "
-import tomllib
-with open('$USER_TOML', 'rb') as f:
+    _repo=$(python3 -c '
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
     c = tomllib.load(f)
-print(c.get('update', {}).get('repo', ''))
-" 2>/dev/null || true)
-    _branch=$(python3 -c "
-import tomllib
-with open('$USER_TOML', 'rb') as f:
+print(c.get("update", {}).get("repo", ""))
+' "$USER_TOML" 2>/dev/null || true)
+    _branch=$(python3 -c '
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
     c = tomllib.load(f)
-print(c.get('update', {}).get('branch', ''))
-" 2>/dev/null || true)
-    [ -n "$_repo" ] && REPO="$_repo"
-    [ -n "$_branch" ] && BRANCH="$_branch"
+print(c.get("update", {}).get("branch", ""))
+' "$USER_TOML" 2>/dev/null || true)
+    if [ -n "$_repo" ] && [ -z "${MCTOMQTT_REPO:-}" ]; then REPO="$_repo"; fi
+    if [ -n "$_branch" ] && [ -z "${MCTOMQTT_BRANCH:-}" ]; then BRANCH="$_branch"; fi
 fi
 
 while [[ $# -gt 0 ]]; do
@@ -41,6 +50,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+BOOTSTRAP_ENV=()
+for selector in MCTOMQTT_REPO MCTOMQTT_BRANCH MCTOMQTT_INSTALL_DIR MCTOMQTT_CONFIG_DIR LOCAL_INSTALL INSTALL_REBUILD_VENV; do
+    if [ "${!selector+x}" = x ]; then
+        BOOTSTRAP_ENV+=("$selector=${!selector}")
+    fi
+done
+
 # Ensure running as root (skip for --help so argparse can respond)
 _needs_root=true
 for arg in "${EXTRA_ARGS[@]}"; do
@@ -48,7 +64,11 @@ for arg in "${EXTRA_ARGS[@]}"; do
 done
 if [ "$_needs_root" = true ] && [ "$(id -u)" -ne 0 ]; then
     echo "This installer requires root privileges. Re-running with sudo..."
-    exec sudo bash "$0" "$@"
+    if [ -f "$0" ]; then
+        exec sudo env "${BOOTSTRAP_ENV[@]}" bash "$0" "${ORIGINAL_ARGS[@]}"
+    fi
+    echo "Error: Pipe this bootstrap into sudo bash, or run its file with sudo."
+    exit 1
 fi
 
 # Check Python 3.11+
@@ -59,8 +79,12 @@ if [ -z "$py_version" ] || [ "$(printf '%s\n' "3.11" "$py_version" | sort -V | h
 fi
 
 # Download installer package to temp dir
+if [ -n "${LOCAL_INSTALL:-}" ]; then
+    LOCAL_INSTALL=$(cd "$LOCAL_INSTALL" && pwd)
+    export LOCAL_INSTALL
+fi
 TMP_DIR=$(mktemp -d)
-trap "rm -rf $TMP_DIR" EXIT
+trap 'rm -rf -- "$TMP_DIR"' EXIT
 
 if [ -n "$LOCAL_INSTALL" ]; then
     cp -r "$LOCAL_INSTALL/installer" "$TMP_DIR/installer"

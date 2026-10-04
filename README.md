@@ -43,6 +43,15 @@ curl -fsSL https://raw.githubusercontent.com/yourusername/meshcoretomqtt/yourbra
   sudo bash -s -- --repo yourusername/meshcoretomqtt --branch yourbranch
 ```
 
+Bootstraps preserve the original arguments when invoking sudo themselves.
+Supported repository, branch, local-source and installation/configuration
+directory environment selectors are explicitly forwarded, not the entire
+caller environment. Installation/configuration directory selectors require
+absolute paths. Native services use `MCTOMQTT_CONFIG_DIR` to find the base
+configuration and sorted `config.d` overlays in a custom directory. Unset or
+empty values default to `/etc/mctomqtt`. Explicit `--config` files bypass both
+that environment setting and the default directories.
+
 ### Local Testing
 
 ```bash
@@ -106,6 +115,10 @@ services.mctomqtt = {
   };
 ```
 
+`serialPorts` are optional candidates, not mandatory systemd device
+dependencies. Missing fallback ports or by-id paths do not prevent startup;
+the application owns serial selection and reconnects.
+
 ## Prerequisites
 
 ### Hardware Setup
@@ -159,7 +172,7 @@ python3 -m pytest tests/
 
 Test tiers:
 
-- Default tests are pure unit tests.
+- Default tests include unit tests and isolated local PTY/MQTT/file tests.
 - Network tests are skipped with `MCTOMQTT_SKIP_NETWORK=1`.
 - System tests are skipped with `MCTOMQTT_SKIP_SYSTEM=1`.
 - End-to-end tests are opt-in with `MCTOMQTT_TEST_E2E=1`.
@@ -181,11 +194,11 @@ or live MQTT transport.
   .version_info
   venv/                     # Python venv (pyserial, paho-mqtt, ed25519-orlp)
 
-/etc/mctomqtt/              # Config (owned root:mctomqtt, 755)
-  config.toml               # Defaults (644, OVERWRITTEN on updates)
-  config.d/                 # Drop-in override directory
+/etc/mctomqtt/              # Config (owned root:mctomqtt, 750)
+  config.toml               # Defaults (640, OVERWRITTEN on updates)
+  config.d/                 # Drop-in override directory (750)
     10-letsmesh.toml        # Optional broker preset selected during install
-    99-user.toml            # User config (644, never overwritten)
+    99-user.toml            # User config (640, never overwritten)
 ```
 
 ## Configuration
@@ -199,6 +212,9 @@ Configuration uses TOML files with a layered override system:
 Files in `config.d/` are loaded alphabetically and deep-merged over the defaults.
 The installer writes presets with a `10-` prefix and user overrides to
 `99-user.toml` so local settings load last.
+Named broker blocks merge recursively in encounter order, including repeated
+names within one file. Later values override earlier values while preserving
+other fields; each name creates one broker connection.
 
 To bypass the default config loading entirely, use `--config`:
 
@@ -376,9 +392,9 @@ signed by an authorized companion device connected via Bluetooth.
 **Security Model:**
 - Commands must be signed with an Ed25519 private key
 - Only companions in the allowlist can send commands
-- Each command JWT has a 30-second expiry (checked against system clock)
-- Nonces prevent replay attacks
-- Responses are signed by the node's private key for end-to-end verification
+- A finite command expiry is required (the web interface normally uses 30 seconds)
+- Nonces are claimed atomically across MQTT workers and kept until at least JWT expiry
+- Responses are signed by the node's private key and sent only to the requesting broker
 
 **Configuration:**
 
@@ -389,6 +405,7 @@ allowed_companions = [
     "03CEBEA3DA9C279CF8EB9449F0CC5BA3690621EE66A3B91067CDBA881EC883A5"
 ]
 nonce_ttl = 120
+max_pending_nonces = 4096
 command_timeout = 10
 ```
 
@@ -401,6 +418,16 @@ command_timeout = 10
 6. Responses are signed and published to the `serial/responses` topic
 
 **Note:** Ensure your system clock is synchronized (NTP) for JWT expiry verification.
+
+`nonce_ttl` is minimum retention, not a limit on token lifetime. The replay
+cache retains longer-lived tokens through their expiry; when the bounded cache
+is full it rejects new commands instead of evicting live nonces. Commands must
+be single nonempty lines within `serial.max_line_bytes` including the CRLF.
+Responses and subscriptions use the source broker's IATA override. Execution
+keeps one serial-session reference across USB reconnects. An accepted nonce
+stays consumed even if execution fails or the response cannot be delivered;
+retry with a freshly signed nonce. This cache is in-memory, not persistent
+across service restarts; keep token lifetimes short.
 
 ## Running the Script
 
@@ -441,6 +468,7 @@ docker run -d \
   --restart unless-stopped \
   --memory=256m --memory-swap=256m --pids-limit=64 \
   --log-driver=json-file --log-opt=max-size=10m --log-opt=max-file=3 \
+  --group-add="$(stat -c %g /path/to/mctomqtt-config)" \
   -v /path/to/mctomqtt-config:/etc/mctomqtt:ro \
   --device=/dev/ttyACM0 \
   mctomqtt:latest
@@ -457,19 +485,34 @@ container mapping. Do not use privileged mode just to work around this.
 Fork, non-main branch and local-source installations build the selected source
 instead of pulling Cisien's upstream `latest` image. Upstream/main installations
 still try that published image first, with a local build fallback.
+Local builds refresh the Dockerfile from the selected sources rather than
+reusing a stale installation recipe. Config directories are `750` and TOML
+files `640`; the installer/updater adds the host configuration directory's
+numeric group to the non-root container. Manual Linux runs need the same
+`--group-add` (shown above). The container always reads `/etc/mctomqtt`, not a
+host-specific `MCTOMQTT_CONFIG_DIR` path.
+The installer and updater parse the base and sorted drop-ins as TOML and map
+every configured serial candidate present on the host when the container is
+created. Missing candidates are skipped. A device added later still requires
+recreating the container to add its mapping.
 
 ### 3. Manual Execution
 
 ```bash
 cd /opt/mctomqtt
-sudo -u mctomqtt ./venv/bin/python3 mctomqtt.py --config /etc/mctomqtt/config.toml
+sudo -u mctomqtt ./venv/bin/python3 mctomqtt.py
 ```
 
 With debug output:
 
 ```bash
-sudo -u mctomqtt ./venv/bin/python3 mctomqtt.py --config /etc/mctomqtt/config.toml --debug
+sudo -u mctomqtt ./venv/bin/python3 mctomqtt.py --debug
 ```
+
+These commands load the base plus user overlays. For a custom configuration
+directory, use `sudo -u mctomqtt env MCTOMQTT_CONFIG_DIR=/absolute/config/path`
+before the Python command. Use explicit `--config` only when intentionally
+bypassing the normal layered configuration.
 
 ## USB and Host Reliability
 
@@ -496,6 +539,11 @@ Full Companion's bare ASCII replies also work when its unframed `> ` prompt
 is immediately followed by a packet/debug log: the prompt ends the reply and
 the following log stays in the capture queue. A prompt before the first reply
 does not complete the command.
+Getter replies support both Full Companion's indented `  > value` and legacy
+`  -> >value` framing, so names containing `DEBUG`, `BLE:`, `RAW:` or `RX,`
+remain values. Complete names and radio values survive embedded `-> >` text.
+Fragmented prompt/getter prefixes survive quiet reader polls. Private keys
+must contain exactly 128 hexadecimal digits after whitespace removal.
 Malformed stats replies and fields are ignored without discarding other valid
 stats. Stats must be JSON objects containing finite, float-representable numeric values, not strings
 or booleans. Negative noise measurements are valid; counters, airtime and
@@ -503,8 +551,10 @@ battery readings must be nonnegative.
 
 After a write/reply timeout the serial session is closed, since this ASCII
 protocol has no transaction IDs with which to identify a late response. The
-main loop reopens the port and verifies that its public key still matches the
-startup radio before resuming capture. `serial.watchdog_timeout = 0` really disables the
+main loop scans configured candidates, closing wrong or unverifiable radios
+and continuing until one matches the startup public key. Initial startup has
+no expected identity and still chooses the first usable candidate, so order
+ports deliberately. `serial.watchdog_timeout = 0` really disables the
 idle reconnect watchdog; quiet meshes are not unhealthy merely because they
 have no packets.
 
@@ -515,6 +565,21 @@ unlimited backlog. Accepted is not the same as delivered: QoS 0 completion
 means handed to the socket, not acknowledged by the broker. A publication
 pending for 120 seconds causes that connection to be retired. These defaults
 can be tuned with the serial/broker options in `config.toml.example`.
+
+Each broker uses its own client-ID prefix. IDs over the portable 23-character
+limit include a 64-bit digest of the full prefix, node identity and broker suffix;
+long prefixes cannot truncate away the identity. Existing long IDs change
+once on upgrade. Online/LWT and final offline status follow the broker's
+`retain` policy; periodic stats status remains non-retained. Shutdown confirms
+offline with QoS 1/2 before closing, sharing a five-second confirmation budget
+across brokers. If confirmation fails, the transport aborts without a graceful
+DISCONNECT so the broker's offline LWT remains the fallback. Cleanup waits for
+any online initialization already in progress and rejects late connection
+callbacks, preventing online status from overwriting the final offline status.
+Confirmed sessions share another one-second budget to send DISCONNECT, keeping
+the final stats and timestamp from being replaced by an older Last Will.
+Unconfirmed connection attempts also abort to preserve their wills. A custom broker
+client without confirmation/abort support cannot provide that guarantee.
 
 One supervisor owns broker reconnects, with persistent per-broker backoff and
 failure counts. MQTT authentication rejection, missing CONNACK and short-lived
@@ -601,7 +666,8 @@ curl -fsSL https://raw.githubusercontent.com/Cisien/meshcoretomqtt/main/scripts/
 
 The migrator will:
 
-- Convert `.env`/`.env.local` configuration to TOML format
+- Escape and validate `.env`/`.env.local` conversion before retiring a working legacy service
+- Atomically write private TOML without printing credentials or overwriting existing user configuration
 - Stop and remove old systemd/launchd services
 - Preserve the old installation directory for manual cleanup
 

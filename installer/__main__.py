@@ -33,11 +33,18 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
+    for selector in ("MCTOMQTT_INSTALL_DIR", "MCTOMQTT_CONFIG_DIR"):
+        selected_dir = os.environ.get(selector)
+        if selected_dir and not os.path.isabs(selected_dir):
+            parser.error(f"{selector} must be an absolute path")
+
     require_root()
 
     ctx = InstallerContext(
         repo=args.repo,
         branch=args.branch,
+        install_dir=os.environ.get("MCTOMQTT_INSTALL_DIR") or "/opt/mctomqtt",
+        config_dir=os.environ.get("MCTOMQTT_CONFIG_DIR") or "/etc/mctomqtt",
         local_install=os.environ.get("LOCAL_INSTALL", ""),
     )
 

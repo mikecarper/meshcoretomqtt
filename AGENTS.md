@@ -22,6 +22,7 @@ python3 mctomqtt.py --config config.toml.example --debug    # enables DEBUG-leve
 ```bash
 docker build -t mctomqtt:latest .
 docker run -d --name mctomqtt --device=/dev/ttyACM0 \
+  --group-add="$(stat -c %g /path/to/mctomqtt-config)" \
   -v /path/to/mctomqtt-config:/etc/mctomqtt:ro \
   mctomqtt:latest
 ```
@@ -43,6 +44,7 @@ The runtime codebase is a `bridge/` Python package with a thin entry point (proj
   - **`state.py`** — `BridgeState` shared mutable state container (all ~30 instance variables)
   - **`topics.py`** — Topic resolution: `get_topic()`, `resolve_topic_template()`, `sanitize_client_id()`
   - **`mqtt_publish.py`** — `safe_publish()`, `build_status_message()`, `publish_status()`
+    and confirmed `publish_shutdown_status()` with LWT fallback
   - **`message_parser.py`** — `RAW_PATTERN`, `PACKET_PATTERN`, `parse_and_publish()`
   - **`remote_serial.py`** — Remote serial command handling, nonce management, JWT validation
   - **`background.py`** - `stats_logging_loop()` and bounded queue diagnostics
@@ -74,7 +76,11 @@ Configuration uses TOML files with a layered override system. Python 3.11+ `toml
 
 **`--config` override:** When one or more `--config <path>` flags are provided, default config loading is completely bypassed. Only the specified files are loaded, in order, each overlaying the previous. Multiple `--config` flags are supported for layered overrides.
 
-**Override mechanism:** Drop-in files are deep-merged over the base config. Nested dicts are merged recursively; `[[broker]]` arrays are merged by `name` field.
+`MCTOMQTT_CONFIG_DIR` replaces the default base/drop-in directory when no
+`--config` is supplied. Native custom-path services set it; Docker still
+mounts and reads `/etc/mctomqtt` inside the container.
+
+**Override mechanism:** Drop-in files are deep-merged over the base config. Nested dicts are merged recursively; `[[broker]]` arrays are merged by `name` field, including repeated names within one file. Later fields win without creating duplicate connections. Applying an override must not mutate its input.
 
 **Key config sections:** `[general]`, `[serial]`, `[topics]`, `[remote_serial]`, `[update]`, `[[broker]]` with nested `[broker.tls]` and `[broker.auth]`.
 
@@ -106,10 +112,34 @@ See `config.toml.example` for the full reference with all options and defaults.
 
 - **Thread safety:** Serial port access is protected by internal locking in `RealSerialConnection`. The main loop, stats thread, and remote serial handler all call methods on the `SerialConnection` ABC — the lock is never exposed to callers.
 - **Bounded capture:** Only the serial reader reads bytes. Commands must not purge RX buffers or consume packet records. Default line/queue bounds are 4096 bytes/256 records; whole-record drops report `DROP:<count>`. Writes and command-lock/reply waits have finite deadlines. A timed-out command closes the session to quarantine late replies.
+  Preserve getter framing (`  >value` and `  -> >value`) before log
+  classification; split the reply prefix only once. Private keys require
+  exactly 128 hexadecimal digits after whitespace removal.
 - **Bounded MQTT:** `PahoBrokerClient` reserves message/byte credits before publishing, including QoS 0. Public `MQTTMessageInfo` receipts reconcile callback-before-return races and MID reuse. Never assume Paho's queue limit covers QoS 0. Manager owns reconnects; Paho automatic reconnect is disabled. Remove no-op/manual WebSocket keepalive workers rather than reintroducing a shared stop flag.
 - **Lifecycle/health:** Start/stop broker work through the manager supervisor, not the USB main loop. Retain retry counts across successful transport setup and reject stale-generation callbacks. Watchdog notifications require progress from both the main loop and supervisor; idle meshes remain healthy. DNS is not guaranteed cancellable. Keep systemd, Docker installer/updater, NixOS, tests and deployment docs aligned when changing resource defaults.
 - **MQTT auth:** Two modes per broker — username/password or JWT auth tokens (generated from device's Ed25519 private key). Tokens are cached with TTL. Auth operations go through the `AuthProvider` ABC.
 - **Graceful shutdown:** SIGTERM/SIGINT handlers set `state.should_exit = True`. The main loop checks this flag each iteration.
+  The supervisor holds transports until explicit stop. Confirm final offline
+  using the broker retain policy and a shared five-second budget; abort
+  unconfirmed transports before DISCONNECT to preserve LWT. Periodic status
+  remains non-retained. Serialize online initialization with the shutdown
+  boundary, reject late CONNACK side effects and abort pending connections.
+  Record confirmation per broker; confirmed sessions share a one-second
+  graceful DISCONNECT window before forced retirement.
+- **Remote serial:** Require finite expiry, bounded single-line commands and
+  native verified claims. Protect nonce pruning/check/reservation with one
+  lock; retain until max(minimum TTL, JWT expiry), rejecting new commands when
+  the bounded cache is full. Keep a captured serial session and route signed
+  responses only to the requesting broker with its IATA. Nonces are not durable
+  across restarts; do not claim persistent replay protection.
+- **Installer safety:** Validate TOML before atomic private writes; config
+  directories/files use 750/640 and Docker gets the host numeric config group.
+  Parse layered serial TOML for Docker mappings and include all present
+  candidates; validate configuration before removing an existing container.
+  Preserve bootstrap argv and explicitly supported environment selectors
+  across sudo. Validate migration before retiring legacy services; refresh
+  Docker recipes from selected sources. Nix serial candidates must not become
+  mandatory device units or writable-path mounts.
 - **Config access:** `state.config` dict with `state.config.get('section', {}).get('key', default)`. Broker configs accessed via `topics.get_broker_config(state, broker_idx)`.
 - **Version:** `__version__` is defined at the top of `mctomqtt.py`. The `.version_info` JSON file (created by installer) appends git hash info. Version is passed to `MeshCoreBridge(config, debug, version)`.
 - **Dependency injection:** All external dependencies (serial, MQTT, auth) are abstracted behind ABCs. Tests inject fakes via `make_test_state()` from `tests/fakes.py`.
@@ -148,9 +178,15 @@ with the NixOS module.
 
 The installer is a Python package (`installer/`) with thin bash bootstraps. Python 3.11+ stdlib only (no pip dependencies for the installer itself).
 
-**Privilege model:** The installer runs as root. Bash bootstraps auto-escalate via `exec sudo bash "$0" "$@"` if not already root. The Python entry point calls `require_root()` before dispatching any command. All file operations use Python stdlib (`os.makedirs`, `shutil.copy2`, `os.chmod`, `shutil.chown`, `Path.write_text`) directly — no `sudo` wrappers or temp-file-then-sudo-cp patterns. The only remaining `sudo` usage is `sudo -u <svc_user>` for privilege-dropping (running commands as the service user).
+**Privilege model:** The installer runs as root. Bash bootstraps capture the
+original argv before parsing and escalate with `sudo env` forwarding only
+supported selectors, then invoke Bash with that original argv. Directory
+selectors must be absolute. The Python entry point validates those selectors
+before `require_root()` and dispatch. File operations use Python stdlib
+directly, not sudo wrappers; TOML uses validated atomic private replacement.
+Service-user commands use `sudo -u <svc_user>` to drop privileges.
 
-**Bash bootstraps** (~60 lines each, download the Python package and dispatch):
+**Bash bootstraps** (download the Python package and dispatch):
 - **`install.sh`** — Runs `python3 -m installer install` (fresh install or update detection)
 - **`scripts/update.sh`** — Runs `python3 -m installer update` (standalone update, reads repo/branch from existing config)
 - **`scripts/migrate.sh`** — Runs `python3 -m installer migrate` (standalone migration from `~/.meshcoretomqtt`)

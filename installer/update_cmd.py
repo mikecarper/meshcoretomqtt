@@ -17,6 +17,7 @@ from .config import (
     migrate_user_config_filename,
     token_preset_brokers,
     user_config_path,
+    write_private_config,
 )
 from .system import (
     LOCAL_IMAGE,
@@ -28,8 +29,10 @@ from .system import (
     detect_service_user,
     detect_system_type,
     docker_run_command,
+    docker_serial_device_args,
     download_repo_archive,
     install_systemd_service,
+    install_launchd_service,
     pull_or_build_docker_image,
     run_cmd,
     set_permissions,
@@ -139,7 +142,8 @@ def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
     os.chmod(f"{ctx.install_dir}/uninstall.sh", 0o755)
 
     # Update base config (overwrite config.toml, preserve user overrides)
-    shutil.copy2(os.path.join(tmp_dir, "config.toml.example"), f"{ctx.config_dir}/config.toml")
+    write_private_config(Path(ctx.config_dir) / "config.toml",
+                         Path(tmp_dir, "config.toml.example").read_text())
     print_success(f"Base config updated at {ctx.config_dir}/config.toml")
     print_success(f"Files updated in {ctx.install_dir}")
 
@@ -209,37 +213,12 @@ def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
 
     if system_type == "docker":
         if ctx.update_mode or prompt_yes_no("Update and restart Docker container?", "y"):
-            # Copy latest Dockerfile from repo archive (for local build fallback)
-            dockerfile_src = os.path.join(repo_dir, "Dockerfile")
-            if os.path.exists(dockerfile_src):
-                shutil.copy2(dockerfile_src, f"{ctx.install_dir}/Dockerfile")
-
             # Pull from registry or build locally
             image = pull_or_build_docker_image(ctx)
             if image is None:
                 print_error("Failed to obtain Docker image")
             else:
-                # Restart container
-                ps_result = run_cmd(["docker", "ps", "-a"], check=False, capture=True)
-                if ps_result.returncode == 0 and "mctomqtt" in ps_result.stdout:
-                    print_info("Restarting container...")
-                    run_cmd(["docker", "stop", "mctomqtt"], check=False)
-                    run_cmd(["docker", "rm", "mctomqtt"], check=False)
-
-                    # Recreate container
-                    serial_device = "/dev/ttyACM0"
-                    if user_toml.exists():
-                        match = re.search(r'^\s*ports\s*=\s*\["([^"]+)"', user_toml.read_text(), re.MULTILINE)
-                        if match:
-                            serial_device = match.group(1)
-
-                    parts = docker_run_command(ctx.config_dir, image)
-                    if Path(serial_device).exists():
-                        parts.insert(-1, f"--device={serial_device}")
-
-                    result = run_cmd(parts, check=False)
-                    if result.returncode == 0:
-                        check_service_health("docker")
+                _restart_docker_container(ctx.config_dir, image)
 
     elif system_type == "systemd":
         install_systemd_service(
@@ -251,10 +230,8 @@ def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
         result = run_cmd(["launchctl", "list"], check=False, capture=True)
         if "com.meshcore.mctomqtt" in (result.stdout or ""):
             if ctx.update_mode or prompt_yes_no("Restart launchd service?", "y"):
-                run_cmd(["launchctl", "stop", "com.meshcore.mctomqtt"], check=False)
-                import time
-                time.sleep(2)
-                run_cmd(["launchctl", "start", "com.meshcore.mctomqtt"], check=False)
+                install_launchd_service(ctx.install_dir, ctx.config_dir,
+                                        is_update=True, auto=True)
                 check_service_health("launchd")
     else:
         print_info("No existing service found")
@@ -266,6 +243,20 @@ def _do_update(ctx: InstallerContext, tmp_dir: str) -> None:
     # Summary
     # ---------------------------------------------------------------------------
     _print_update_summary(ctx, system_type)
+
+
+def _restart_docker_container(config_dir: str, image: str) -> None:
+    """Prepare mappings before replacing an existing Docker container."""
+    parts = docker_run_command(config_dir, image)
+    parts[-1:-1] = docker_serial_device_args(config_dir)
+    ps_result = run_cmd(["docker", "ps", "-a"], check=False, capture=True)
+    if ps_result.returncode == 0 and "mctomqtt" in ps_result.stdout:
+        print_info("Restarting container...")
+        run_cmd(["docker", "stop", "mctomqtt"], check=False)
+        run_cmd(["docker", "rm", "mctomqtt"], check=False)
+        result = run_cmd(parts, check=False)
+        if result.returncode == 0:
+            check_service_health("docker")
 
 
 def _print_update_summary(ctx: InstallerContext, system_type: str) -> None:

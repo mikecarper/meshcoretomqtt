@@ -117,7 +117,7 @@ class TestHandleSerialCommand:
         state.mqtt_connected = True
 
         # Pre-record the nonce
-        state.remote_serial_nonces["testnonce123"] = int(time.time())
+        state.remote_serial_nonces["testnonce123"] = int(time.time()) + 120
 
         token = _make_command_token(state.auth)
         handle_serial_command(state, token, broker_idx=0)
@@ -159,7 +159,7 @@ class TestCleanupNonces:
 
     def test_keeps_fresh(self):
         state = _make_remote_state()
-        fresh_time = int(time.time())
+        fresh_time = int(time.time()) + 120
         state.remote_serial_nonces = {"fresh_nonce": fresh_time}
         cleanup_old_nonces(state)
         assert "fresh_nonce" in state.remote_serial_nonces

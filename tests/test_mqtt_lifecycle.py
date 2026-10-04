@@ -193,6 +193,19 @@ def test_wrong_raw_client_identity_is_rejected_even_with_current_generation():
     assert info['failed_attempts'] == 0
 
 
+def test_successful_connack_after_exit_does_not_publish_online():
+    state, manager, clock, factory = make_manager({0: ['silent']})
+    manager.reconnect_disconnected_brokers()
+    client = factory.clients[0]
+    state.should_exit = True
+    manager.on_mqtt_connect(client, client.userdata, None, 0)
+    assert not state.mqtt_connected
+    assert not state.mqtt_clients[0]['connected']
+    assert not client.published
+    assert not client.subscribed
+    assert manager.stop(timeout=1)
+
+
 def test_short_lived_success_preserves_backoff():
     state, manager, clock, factory = make_manager({0: [5, 0, 0]})
     manager.reconnect_disconnected_brokers()

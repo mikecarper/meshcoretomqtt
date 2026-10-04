@@ -7,6 +7,7 @@ import platform
 import shutil
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +20,8 @@ from .config import (
     _update_iata_in_file,
     migrate_user_config_filename,
     user_config_path,
+    write_private_config,
+    _toml_dumps,
 )
 from .migrate_cmd import run_migrate
 from .system import (
@@ -31,6 +34,7 @@ from .system import (
     install_docker_service,
     install_launchd_service,
     install_systemd_service,
+    manual_run_command,
     prompt_service_user,
     run_cmd,
     set_permissions,
@@ -219,7 +223,8 @@ def _do_install(ctx: InstallerContext, tmp_dir: str) -> None:
     os.chmod(f"{ctx.install_dir}/uninstall.sh", 0o755)
 
     # Install base config
-    shutil.copy2(os.path.join(tmp_dir, "config.toml.example"), f"{ctx.config_dir}/config.toml")
+    write_private_config(Path(ctx.config_dir) / "config.toml",
+                         Path(tmp_dir, "config.toml.example").read_text())
     print_success(f"Base config installed to {ctx.config_dir}/config.toml")
     print_success(f"Files installed to {ctx.install_dir}")
 
@@ -286,10 +291,10 @@ def _install_new_service(ctx: InstallerContext) -> None:
         docker_installed = install_docker_service(ctx)
     elif ctx.install_method == "3":
         print_info("Skipping service installation")
-        print_info(f"To run manually: {ctx.install_dir}/venv/bin/python3 {ctx.install_dir}/mctomqtt.py --config {ctx.config_dir}/config.toml")
+        print_info(f"To run manually: {manual_run_command(ctx.install_dir, ctx.config_dir)}")
     else:
         print_warning("Invalid selection, skipping service installation")
-        print_info(f"To run manually: {ctx.install_dir}/venv/bin/python3 {ctx.install_dir}/mctomqtt.py --config {ctx.config_dir}/config.toml")
+        print_info(f"To run manually: {manual_run_command(ctx.install_dir, ctx.config_dir)}")
 
     # Store for summary
     ctx._docker_installed = docker_installed
@@ -332,7 +337,7 @@ def _print_install_summary(ctx: InstallerContext, migration_done: bool) -> None:
             print("  Status:  launchctl list | grep mctomqtt")
             print("  Logs:    tail -f /var/log/mctomqtt.log")
     else:
-        print(f"Manual run: {ctx.install_dir}/venv/bin/python3 {ctx.install_dir}/mctomqtt.py --config {ctx.config_dir}/config.toml")
+        print(f"Manual run: {manual_run_command(ctx.install_dir, ctx.config_dir)}")
 
     if migration_done:
         print()
@@ -367,9 +372,10 @@ def _handle_config_url(ctx: InstallerContext, user_toml: Path) -> None:
     print_info(f"Downloading configuration from: {ctx.config_url}")
 
     try:
-        download_file(ctx.config_url, str(user_toml), "99-user.toml")
-    except subprocess.CalledProcessError:
-        print_error("Failed to download configuration from URL")
+        content = load_config_url(ctx.config_url)
+        data = tomllib.loads(content)
+    except (subprocess.CalledProcessError, OSError, tomllib.TOMLDecodeError):
+        print_error("Failed to download or validate configuration from URL")
         if prompt_yes_no("Continue with interactive configuration?", "y"):
             configure_mqtt_brokers(ctx)
         else:
@@ -378,22 +384,13 @@ def _handle_config_url(ctx: InstallerContext, user_toml: Path) -> None:
 
     print_success("Configuration downloaded successfully")
 
-    # Show what was downloaded
-    print()
-    print_info("Downloaded configuration:")
-    content = user_toml.read_text()
-    non_empty = [l for l in content.splitlines() if l.strip() and not l.strip().startswith("#")]
-    for line in non_empty[:20]:
-        print(line)
-    if len(non_empty) > 20:
-        print("...")
-    print()
+    print_info("Configuration contents are not printed because they may contain credentials")
 
     if prompt_yes_no("Use this configuration?", "y"):
         print_success("Using downloaded configuration")
 
         # Prompt for IATA
-        existing_iata = _read_existing_iata(str(user_toml))
+        existing_iata = data.get("general", {}).get("iata", "")
         has_letsmesh = "letsmesh" in content
 
         if has_letsmesh:
@@ -401,12 +398,8 @@ def _handle_config_url(ctx: InstallerContext, user_toml: Path) -> None:
         else:
             iata = prompt_iata_simple(existing_iata)
 
-        if "iata = " in content:
-            _update_iata_in_file(str(user_toml), iata)
-        else:
-            # Prepend general section with iata
-            new_content = f'[general]\niata = "{iata}"\n\n' + content
-            user_toml.write_text(new_content)
+        data.setdefault("general", {})["iata"] = iata
+        write_private_config(user_toml, _toml_dumps(data))
 
         print_success(f"IATA code set to: {iata}")
 
@@ -417,5 +410,14 @@ def _handle_config_url(ctx: InstallerContext, user_toml: Path) -> None:
         else:
             configure_mqtt_brokers(ctx)
     else:
-        user_toml.unlink(missing_ok=True)
         configure_mqtt_brokers(ctx)
+
+
+def load_config_url(url: str) -> str:
+    """Download and validate a candidate without overwriting active configuration."""
+    with tempfile.TemporaryDirectory(prefix="mctomqtt-config-") as candidate_dir:
+        candidate = Path(candidate_dir) / "99-user.toml"
+        download_file(url, str(candidate), "99-user.toml candidate")
+        content = candidate.read_text()
+        tomllib.loads(content)
+        return content

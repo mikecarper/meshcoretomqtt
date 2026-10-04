@@ -45,6 +45,7 @@ class TestSetPermissions:
         # Verify config_dir mode is 750
         mode = oct(os.stat(config_dir).st_mode)[-3:]
         assert mode == "750"
+        assert os.stat(config_dir / "config.d").st_mode & 0o777 == 0o750
 
     def test_set_permissions_config_file_mode(self, dirs: tuple[Path, Path]) -> None:
         install_dir, config_dir = dirs
@@ -55,3 +56,4 @@ class TestSetPermissions:
         config_toml = config_dir / "config.toml"
         mode = oct(os.stat(config_toml).st_mode)[-3:]
         assert mode == "640"
+        assert os.stat(config_dir / "config.d" / "99-user.toml").st_mode & 0o777 == 0o640

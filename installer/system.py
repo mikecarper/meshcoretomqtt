@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import os
 import platform
+import plistlib
 import pwd
+import shlex
 import shutil
 import subprocess
+import tempfile
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -48,6 +52,71 @@ def run_cmd(
         shell=shell,
         **kwargs,
     )
+
+
+def _unit_argument(value: str, *, expand_dollars: bool = False) -> str:
+    if any(ord(char) < 32 for char in value):
+        raise ValueError("Service values must not contain control characters")
+    value = value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
+    if expand_dollars:
+        value = value.replace("$", "$$")
+    return '"' + value + '"'
+
+
+def render_systemd_template(content: str, install_dir: str, config_dir: str,
+                            svc_user: str) -> str:
+    """Apply native paths without discarding layered configuration."""
+    import re
+    _unit_argument(install_dir)
+    config_environment = _unit_argument(f"MCTOMQTT_CONFIG_DIR={config_dir}")
+    executable = f"{install_dir}/venv/bin/python3"
+    command = (_unit_argument(executable, expand_dollars=True)
+               + " " + _unit_argument(f"{install_dir}/mctomqtt.py", expand_dollars=True))
+    # systemd forbids these in its executable token, even when quoted. env
+    # accepts them as an ordinary argument and execs Python without a wrapper PID.
+    if any(char in executable for char in '$"\\'):
+        command = "/usr/bin/env " + command
+    values = {
+        "User": svc_user,
+        "Group": svc_user,
+        # This directive takes a raw path, not a quoted argument. A trailing
+        # slash preserves names ending in whitespace or a line-continuation '\\'.
+        "WorkingDirectory": (install_dir.rstrip("/") + "/").replace("%", "%%"),
+        "ExecStart": command,
+        "ReadWritePaths": _unit_argument(install_dir),
+    }
+    for key, value in values.items():
+        content = re.sub(rf"^{key}=.*$", lambda match, k=key, v=value: f"{k}={v}",
+                         content, flags=re.MULTILINE)
+    # Our dedicated environment assignment must override any template default.
+    content = re.sub(r'^Environment=.*MCTOMQTT_CONFIG_DIR=.*\n?', "", content,
+                     flags=re.MULTILINE)
+    return content.replace("[Service]\n", f"[Service]\nEnvironment={config_environment}\n", 1)
+
+
+def render_launchd_plist(install_dir: str, config_dir: str, label: str,
+                         template: bytes | None = None) -> bytes:
+    """Render native launchd paths and a private layered-config location."""
+    data = plistlib.loads(template) if template is not None else {
+        "Label": label, "RunAtLoad": True, "KeepAlive": True,
+        "StandardOutPath": "/var/log/mctomqtt.log",
+        "StandardErrorPath": "/var/log/mctomqtt-error.log",
+    }
+    extras = data.get("ProgramArguments", [])[2:]
+    data["Label"] = label
+    data["ProgramArguments"] = [f"{install_dir}/venv/bin/python3",
+                                f"{install_dir}/mctomqtt.py", *extras]
+    data["WorkingDirectory"] = install_dir
+    data.setdefault("EnvironmentVariables", {})["MCTOMQTT_CONFIG_DIR"] = config_dir
+    return plistlib.dumps(data, sort_keys=False)
+
+
+def manual_run_command(install_dir: str, config_dir: str) -> str:
+    """Render a shell command that loads base config and its drop-in overrides."""
+    return shlex.join([
+        "env", f"MCTOMQTT_CONFIG_DIR={config_dir}",
+        f"{install_dir}/venv/bin/python3", f"{install_dir}/mctomqtt.py",
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -410,21 +479,21 @@ def set_permissions(install_dir: str, config_dir: str, svc_user: str) -> None:
     chown_recursive(install_dir, svc_user, svc_user)
     print_success(f"{install_dir} owned by {svc_user}:{svc_user}")
 
-    # /etc/mctomqtt owned by root:svc_user, mode 755 (world-readable)
+    # Config directories are owned by root:svc_user, mode 750 (private group access).
     chown_recursive(config_dir, "root", svc_user)
-    os.chmod(config_dir, 0o755)
+    os.chmod(config_dir, 0o750)
     config_d = Path(config_dir) / "config.d"
     if config_d.exists():
-        os.chmod(str(config_d), 0o755)
+        os.chmod(str(config_d), 0o750)
 
     config_toml = Path(config_dir) / "config.toml"
     if config_toml.exists():
-        os.chmod(str(config_toml), 0o644)
+        os.chmod(str(config_toml), 0o640)
 
-    for override in config_d.glob("*.toml") if config_d.exists() else []:
-        os.chmod(str(override), 0o644)
+    for override in config_d.glob("*.toml*") if config_d.exists() else []:
+        os.chmod(str(override), 0o640)
 
-    print_success(f"Permissions set on {config_dir} (root:{svc_user}, 755/644)")
+    print_success(f"Permissions set on {config_dir} (root:{svc_user}, 750/640)")
 
 
 # ---------------------------------------------------------------------------
@@ -461,18 +530,8 @@ def pull_or_build_docker_image(ctx: InstallerContext) -> str | None:
     else:
         print_info("Building selected fork, branch or local sources instead of the upstream image...")
 
-    dockerfile_path = Path(ctx.install_dir) / "Dockerfile"
-    if not dockerfile_path.exists():
-        if ctx.repo_dir:
-            src = Path(ctx.repo_dir) / "Dockerfile"
-            if src.exists():
-                shutil.copy2(str(src), str(dockerfile_path))
-            else:
-                print_error("Dockerfile not found in repository archive")
-                return None
-        else:
-            print_error("No repository archive available for Dockerfile")
-            return None
+    if not stage_dockerfile(ctx):
+        return None
 
     print_info(f"Building {LOCAL_IMAGE} image...")
     print()
@@ -485,12 +544,68 @@ def pull_or_build_docker_image(ctx: InstallerContext) -> str | None:
     return LOCAL_IMAGE
 
 
+def stage_dockerfile(ctx: InstallerContext) -> bool:
+    """Atomically select the current source recipe, never an unrelated old one."""
+    source_root = ctx.local_install or ctx.repo_dir
+    if not source_root:
+        print_error("No selected source directory available for Dockerfile")
+        return False
+    source = Path(source_root) / "Dockerfile"
+    if not source.is_file():
+        print_error("Dockerfile not found in selected sources")
+        return False
+    dest = Path(ctx.install_dir) / "Dockerfile"
+    if source.resolve() == dest.resolve():
+        return True
+    fd, temporary = tempfile.mkstemp(prefix=".Dockerfile.", dir=dest.parent)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            os.fchmod(output.fileno(), 0o644)
+            output.write(source.read_bytes())
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, dest)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return True
+
+
 def _docker_registry_image(ctx: InstallerContext) -> str | None:
     """A registry image must not silently replace a fork/branch/local checkout."""
     if (ctx.repo.lower() == "cisien/meshcoretomqtt" and ctx.branch == "main"
             and not ctx.local_install):
         return GHCR_IMAGE
     return None
+
+
+def docker_serial_device_args(config_dir: str) -> list[str]:
+    """Map existing serial candidates from the effective layered TOML config."""
+    root = Path(config_dir)
+    sources = [root / "config.toml"] if (root / "config.toml").exists() else []
+    sources.extend(sorted((root / "config.d").glob("*.toml")))
+    serial_config: Any = {}
+    for source in sources:
+        with source.open("rb") as config_file:
+            data = tomllib.load(config_file)
+        if "serial" in data:
+            override = data["serial"]
+            if isinstance(serial_config, dict) and isinstance(override, dict):
+                serial_config = {**serial_config, **override}
+            else:
+                serial_config = override
+    if not isinstance(serial_config, dict):
+        raise ValueError("Serial configuration must be a TOML table")
+    ports = serial_config.get("ports", ["/dev/ttyACM0"])
+    if not isinstance(ports, list) or any(not isinstance(port, str) or not port for port in ports):
+        raise ValueError("Serial ports must be an array of non-empty strings")
+
+    arguments = []
+    for port in dict.fromkeys(ports):
+        if Path(port).exists():
+            arguments.append(f"--device={port}")
+        else:
+            print_warning(f"Serial device {port} not found - it will not be mapped into the container")
+    return arguments
 
 
 # ---------------------------------------------------------------------------
@@ -720,8 +835,6 @@ def install_systemd_service(
         r = run_cmd(["systemctl", "is-active", unit_file], check=False, capture=True)
         if r.returncode == 0:
             service_was_running = True
-            print_info("Stopping running service...")
-            run_cmd(["systemctl", "stop", unit_file])
 
     # Generate unit file from template or from scratch
     template_path = Path(install_dir) / "mctomqtt.service"
@@ -765,6 +878,7 @@ WantedBy=multi-user.target
 """
         print_info(f"Generated systemd unit (User={svc_user})")
 
+    content = render_systemd_template(content, install_dir, config_dir, svc_user)
     print_info("Installing service file...")
     try:
         unit_path.write_text(content)
@@ -780,7 +894,7 @@ WantedBy=multi-user.target
             print_success("Service re-enabled")
         if service_was_running:
             print_info("Restarting service...")
-            run_cmd(["systemctl", "start", unit_file])
+            run_cmd(["systemctl", "restart", unit_file])
             check_service_health("systemd")
         print_success("Systemd service updated")
     else:
@@ -811,36 +925,18 @@ def install_launchd_service(
 
     if template.exists():
         print_info("Installing plist from template...")
-        shutil.copy2(str(template), plist_dest)
+        content = render_launchd_plist(install_dir, config_dir, plist_label, template.read_bytes())
     else:
-        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{plist_label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{install_dir}/venv/bin/python3</string>
-        <string>{install_dir}/mctomqtt.py</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>{install_dir}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/var/log/mctomqtt.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/mctomqtt-error.log</string>
-</dict>
-</plist>
-"""
-        Path(plist_dest).write_text(plist_content)
+        content = render_launchd_plist(install_dir, config_dir, plist_label)
+
+    Path(plist_dest).write_bytes(content)
 
     shutil.chown(plist_dest, "root", "wheel")
     os.chmod(plist_dest, 0o644)
+
+    if is_update:
+        # Do not retire the existing job until its replacement parses and saves.
+        run_cmd(["launchctl", "unload", plist_dest], check=False)
 
     if auto or prompt_yes_no("Load service now?", "y"):
         run_cmd(["launchctl", "load", plist_dest])
@@ -874,23 +970,9 @@ def install_docker_service(ctx: InstallerContext) -> bool:
     if image is None:
         return False
 
-    # Get serial device from the user override file
-    serial_device = "/dev/ttyACM0"
-    user_toml = Path(ctx.config_dir) / "config.d" / "99-user.toml"
-    if not user_toml.exists():
-        user_toml = Path(ctx.config_dir) / "config.d" / "00-user.toml"
-    if user_toml.exists():
-        import re
-        match = re.search(r'^\s*ports\s*=\s*\["([^"]+)"', user_toml.read_text(), re.MULTILINE)
-        if match:
-            serial_device = match.group(1)
-
     # Build docker run command
     parts = docker_run_command(ctx.config_dir, image)
-    if Path(serial_device).exists():
-        parts.insert(-1, f"--device={serial_device}")
-    else:
-        print_warning(f"Serial device {serial_device} not found - container will start but may not connect")
+    parts[-1:-1] = docker_serial_device_args(ctx.config_dir)
 
     print()
     print_info("Docker run command:")
@@ -915,12 +997,20 @@ def install_docker_service(ctx: InstallerContext) -> bool:
     return True
 
 
-def docker_run_command(config_dir: str, image: str) -> list[str]:
+def docker_run_command(config_dir: str, image: str, *, config_gid: int | None = None) -> list[str]:
     """Build bounded deployment defaults without invoking Docker."""
+    if config_gid is None:
+        try:
+            config_gid = Path(config_dir).stat().st_gid
+        except FileNotFoundError:
+            config_gid = os.getgid()
+    if isinstance(config_gid, bool) or not isinstance(config_gid, int) or config_gid < 0:
+        raise ValueError("config_gid must be a non-negative numeric group id")
     return [
         "docker", "run", "-d", "--name", "mctomqtt", "--restart", "unless-stopped",
         "--memory=256m", "--memory-swap=256m", "--pids-limit=64",
         "--log-driver=json-file", "--log-opt=max-size=10m", "--log-opt=max-file=3",
+        f"--group-add={config_gid}",
         "-v", f"{config_dir}:/etc/mctomqtt:ro", image,
     ]
 

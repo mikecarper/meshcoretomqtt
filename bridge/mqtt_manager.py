@@ -97,7 +97,12 @@ class MqttManager:
                 logger.error('[MQTT] No enabled brokers configured')
                 self.state.should_exit = True
                 return
-            while not self._stop.is_set() and not self.state.should_exit:
+            while not self._stop.is_set():
+                if self.state.should_exit:
+                    # The runner confirms offline status before stop(). Do
+                    # not reconnect or close its transports during that wait.
+                    self._stop.wait(0.1)
+                    continue
                 self.last_progress_monotonic = self._clock()
                 self.reconnect_disconnected_brokers()
                 self.last_progress_monotonic = self._clock()
@@ -129,20 +134,48 @@ class MqttManager:
             thread.join(timeout=max(0.0, timeout))
         return not thread.is_alive()
 
+    def begin_shutdown(self) -> None:
+        """Finish any online initialization before the final offline update.
+
+        A successful CONNACK callback may already be publishing its retained
+        online status when a signal requests exit. Serialize that publication
+        with cleanup so it cannot overwrite the subsequently confirmed offline
+        status, and reject any new CONNACK side effects after this point.
+        """
+        with self._lock:
+            self.state.should_exit = True
+
     @staticmethod
-    def _close_client(client: BrokerClient | None) -> None:
+    def _close_client(
+        client: BrokerClient | None, *, preserve_lwt: bool = False,
+        graceful_timeout: float | None = None,
+    ) -> None:
         if client is None:
             return
+        abort = getattr(client, 'abort', None)
+        aborted = False
+        if preserve_lwt and abort is not None:
+            try:
+                # A cancelled CONNECT may have reached the broker even before
+                # its CONNACK was processed. Close first so DISCONNECT cannot
+                # suppress the offline will after cleanup skipped that slot.
+                abort()
+                aborted = True
+            except Exception:
+                logger.debug('[MQTT] Error preserving retired client will', exc_info=True)
         try:
             # Disconnect first: loop_stop alone does not close the socket.
-            client.disconnect()
+            graceful = getattr(client, 'disconnect_gracefully', None)
+            if graceful_timeout is not None and graceful is not None:
+                graceful(timeout=graceful_timeout)
+            else:
+                client.disconnect()
         except Exception:
             logger.debug('[MQTT] Error disconnecting retired client', exc_info=True)
         try:
             # A non-reading peer can leave DISCONNECT behind queued QoS 0 data.
             # Force the transport closed before loop_stop joins Paho's worker.
-            abort = getattr(client, 'abort', None)
-            if abort is not None:
+            if abort is not None and not aborted:
                 abort()
         except Exception:
             logger.debug('[MQTT] Error aborting retired transport', exc_info=True)
@@ -157,11 +190,18 @@ class MqttManager:
             for info in self.state.mqtt_clients:
                 info['generation'] = info.get('generation', 0) + 1
                 info['connected'] = False
-                clients.append(info.get('client'))
+                clients.append((info.get('client'), info.get('shutdown_confirmed', False)))
                 info['client'] = None
             self.state.mqtt_connected = False
-        for client in clients:
-            self._close_client(client)
+        # Share one short DISCONNECT window across all confirmed brokers. An
+        # unconfirmed session must preserve its will without a graceful send.
+        graceful_deadline = time.monotonic() + 1.0
+        for client, confirmed in clients:
+            self._close_client(
+                client, preserve_lwt=self.state.should_exit and not confirmed,
+                graceful_timeout=max(0.0, graceful_deadline - time.monotonic())
+                if confirmed else None,
+            )
 
     def connect_all_brokers(self) -> bool:
         """Synchronous compatibility entry point without duplicate clients."""
@@ -266,7 +306,8 @@ class MqttManager:
         broker_name = userdata.get('name', 'unknown') if userdata else 'unknown'
         with self._lock:
             info = self._current_callback(client, userdata)
-            if info is None or info.get('attempt_failed', False):
+            if (info is None or info.get('attempt_failed', False)
+                    or state.should_exit):
                 return
             broker_idx = info['broker_idx']
             if rc != 0:
@@ -281,17 +322,17 @@ class MqttManager:
             state.mqtt_connected = True
             state.connection_events[broker_idx].set()
             broker_client = info['client']
-        logger.info('[%s] Connected to broker', broker_name)
-        broker = topics.get_broker_config(state, broker_idx)
-        try:
-            broker_client.publish(
-                topics.get_topic(state, 'status', broker_idx),
-                json.dumps(build_status_message(state, 'online')),
-                qos=broker.get('qos', 0), retain=broker.get('retain', True),
-            )
-            remote_serial.subscribe_serial_commands(state, broker_client, broker_idx)
-        except Exception:
-            logger.exception('[%s] Failed to initialize broker status/subscription', broker_name)
+            logger.info('[%s] Connected to broker', broker_name)
+            broker = topics.get_broker_config(state, broker_idx)
+            try:
+                broker_client.publish(
+                    topics.get_topic(state, 'status', broker_idx),
+                    json.dumps(build_status_message(state, 'online')),
+                    qos=broker.get('qos', 0), retain=broker.get('retain', True),
+                )
+                remote_serial.subscribe_serial_commands(state, broker_client, broker_idx)
+            except Exception:
+                logger.exception('[%s] Failed to initialize broker status/subscription', broker_name)
 
     def on_mqtt_disconnect(self, client: Any, userdata: dict[str, Any] | None, disconnect_flags: Any, reason_code: Any, properties: Any) -> None:
         with self._lock:
@@ -417,13 +458,9 @@ class MqttManager:
         broker_name = broker.get('name', f'broker-{broker_idx}')
 
         # Build client ID
-        prefix = "meshcore_"
-        brokers = state.config.get('broker', [])
-        if brokers:
-            prefix = brokers[0].get('client_id_prefix', 'meshcore_')
-        client_id = topics.sanitize_client_id(state.repeater_pub_key, prefix)
-        if broker_idx > 0:
-            client_id += f"_{broker_idx}"
+        prefix = broker.get('client_id_prefix', 'meshcore_')
+        suffix = f"_{broker_idx}" if broker_idx > 0 else ""
+        client_id = topics.sanitize_client_id(state.repeater_pub_key, prefix, suffix=suffix)
 
         transport = broker.get('transport', 'tcp')
 
@@ -512,7 +549,7 @@ class MqttManager:
                 if not aborted:
                     info['client'] = broker_client
             if aborted:
-                self._close_client(broker_client)
+                self._close_client(broker_client, preserve_lwt=True)
                 return None
             broker_client.connect(server, port, keepalive=keepalive)
             with self._lock:
@@ -524,7 +561,7 @@ class MqttManager:
                 elif info.get('client') is broker_client:
                     info['client'] = None
             if aborted:
-                self._close_client(broker_client)
+                self._close_client(broker_client, preserve_lwt=True)
                 return None
             logger.info('[%s] Connecting to %s:%s (transport=%s, tls=%s, keepalive=%ss)',
                         broker_name, server, port, transport, use_tls, keepalive)
@@ -535,5 +572,5 @@ class MqttManager:
                     info['client'] = None
                 if info['generation'] == generation and not self._stop.is_set():
                     self._record_failure(info, self._clock(), f'transport connect failed: {error}')
-            self._close_client(broker_client)
+            self._close_client(broker_client, preserve_lwt=state.should_exit or self._stop.is_set())
             return None

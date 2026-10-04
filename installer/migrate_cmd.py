@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .system import download_repo_archive, run_cmd
+from .config import toml_escape, write_private_config
 from .ui import (
     print_header,
     print_info,
@@ -65,7 +66,7 @@ def env_to_toml(env: dict[str, str]) -> str:
             if v in ("true", "false"):
                 lines.append(f"{k} = {v}")
             else:
-                lines.append(f'{k} = "{v}"')
+                lines.append(f'{k} = "{toml_escape(v)}"')
         lines.append("")
 
     # Serial section
@@ -76,7 +77,7 @@ def env_to_toml(env: dict[str, str]) -> str:
         lines.append("[serial]")
         if ports:
             port_list = [p.strip() for p in ports.split(",") if p.strip()]
-            ports_str = ", ".join(f'"{p}"' for p in port_list)
+            ports_str = ", ".join(f'"{toml_escape(p)}"' for p in port_list)
             lines.append(f"ports = [{ports_str}]")
         if baud and baud != "115200":
             lines.append(f"baud_rate = {baud}")
@@ -90,9 +91,9 @@ def env_to_toml(env: dict[str, str]) -> str:
     if repo or branch:
         lines.append("[update]")
         if repo:
-            lines.append(f'repo = "{repo}"')
+            lines.append(f'repo = "{toml_escape(repo)}"')
         if branch:
-            lines.append(f'branch = "{branch}"')
+            lines.append(f'branch = "{toml_escape(branch)}"')
         lines.append("")
 
     # Remote serial
@@ -103,7 +104,7 @@ def env_to_toml(env: dict[str, str]) -> str:
         lines.append(f"enabled = {rs_enabled}")
         if rs_companions:
             companion_list = [c.strip() for c in rs_companions.split(",") if c.strip()]
-            comp_str = ", ".join(f'"{c}"' for c in companion_list)
+            comp_str = ", ".join(f'"{toml_escape(c)}"' for c in companion_list)
             lines.append(f"allowed_companions = [{comp_str}]")
         else:
             lines.append("allowed_companions = []")
@@ -142,11 +143,11 @@ def env_to_toml(env: dict[str, str]) -> str:
             broker_name = f"custom-{broker_num}"
 
         lines.append("[[broker]]")
-        lines.append(f'name = "{broker_name}"')
+        lines.append(f'name = "{toml_escape(broker_name)}"')
         lines.append("enabled = true")
-        lines.append(f'server = "{server}"')
+        lines.append(f'server = "{toml_escape(server)}"')
         lines.append(f"port = {port_val}")
-        lines.append(f'transport = "{transport}"')
+        lines.append(f'transport = "{toml_escape(transport)}"')
         lines.append(f"keepalive = {keepalive}")
         lines.append(f"qos = {qos}")
         lines.append(f"retain = {retain}")
@@ -162,15 +163,15 @@ def env_to_toml(env: dict[str, str]) -> str:
         if use_auth_token == "true":
             lines.append('method = "token"')
             if token_audience:
-                lines.append(f'audience = "{token_audience}"')
+                lines.append(f'audience = "{toml_escape(token_audience)}"')
             if token_owner:
-                lines.append(f'owner = "{token_owner}"')
+                lines.append(f'owner = "{toml_escape(token_owner)}"')
             if token_email:
-                lines.append(f'email = "{token_email}"')
+                lines.append(f'email = "{toml_escape(token_email)}"')
         elif username:
             lines.append('method = "password"')
-            lines.append(f'username = "{username}"')
-            lines.append(f'password = "{password}"')
+            lines.append(f'username = "{toml_escape(username)}"')
+            lines.append(f'password = "{toml_escape(password)}"')
         else:
             lines.append('method = "none"')
         lines.append("")
@@ -214,6 +215,25 @@ def mark_migrated(old_dir: str, install_dir: str) -> None:
     )
 
 
+def prepare_migrated_config(merged: dict[str, str], config_dir: str) -> Path | None:
+    """Commit validated private config before any legacy service is retired."""
+    dest = Path(config_dir) / "config.d" / "99-user.toml"
+    legacy = dest.with_name("00-user.toml")
+    if dest.exists() or dest.is_symlink() or legacy.exists() or legacy.is_symlink():
+        raise FileExistsError("Existing user configuration must not be overwritten by migration")
+    if not merged:
+        return None
+    content = ("# MeshCore to MQTT - User Configuration\n"
+               "# Migrated from legacy .env/.env.local installation\n\n"
+               + env_to_toml(merged))
+    # Invalid numeric/boolean inputs fail before creating a directory or file.
+    import tomllib
+    tomllib.loads(content)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    write_private_config(dest, content, overwrite=False)
+    return dest
+
+
 def run_migrate(ctx: InstallerContext) -> bool:
     """Migrate from ~/.meshcoretomqtt to /opt/mctomqtt.
 
@@ -227,6 +247,12 @@ def run_migrate(ctx: InstallerContext) -> bool:
         print_info("Legacy installation already migrated. Skipping.")
         return False
 
+    config_d = Path(ctx.config_dir) / "config.d"
+    if any(path.exists() or path.is_symlink()
+           for path in (config_d / "99-user.toml", config_d / "00-user.toml")):
+        print_warning("Existing user configuration found; leaving legacy installation untouched")
+        return False
+
     print()
     print_header("Legacy Installation Detected")
     print_info(f"Found existing installation at: {old_dir}")
@@ -236,10 +262,7 @@ def run_migrate(ctx: InstallerContext) -> bool:
         print_info("Skipping migration. Old installation left in place.")
         return False
 
-    # Step 1: Stop old services
-    _stop_old_services(old_dir)
-
-    # Step 2: Migrate config
+    # Prepare the configuration before touching working legacy services.
     print_info("Migrating configuration to TOML format...")
 
     old_env = os.path.join(old_dir, ".env")
@@ -282,32 +305,14 @@ def run_migrate(ctx: InstallerContext) -> bool:
     merged.update(env_customizations)
     merged.update(user_env_local)
 
-    # Create config directory
-    os.makedirs(f"{ctx.config_dir}/config.d", exist_ok=True)
+    migrated_toml_path = prepare_migrated_config(merged, ctx.config_dir)
+    if migrated_toml_path is None:
+        print_warning("No user configuration found; leaving legacy services untouched")
+        return False
+    print_success(f"Configuration migrated to {migrated_toml_path}")
+    print_info("Configuration contents are not printed because they may contain credentials")
 
-    migrated_toml_path = f"{ctx.config_dir}/config.d/99-user.toml"
-
-    if not merged:
-        print_warning("No user configuration found to migrate")
-    else:
-        toml_content = env_to_toml(merged)
-
-        # Write directly
-        Path(migrated_toml_path).write_text(
-            "# MeshCore to MQTT - User Configuration\n"
-            "# Migrated from legacy .env/.env.local installation\n\n"
-            + toml_content
-        )
-
-        if os.path.exists(migrated_toml_path):
-            print_success(f"Configuration migrated to {migrated_toml_path}")
-            print()
-            print_info("Migrated configuration:")
-            content = Path(migrated_toml_path).read_text()
-            print(content)
-            print()
-        else:
-            print_warning("No configuration was migrated (no user overrides found)")
+    _stop_old_services(old_dir)
 
     # Step 3: Remove old systemd unit
     _cleanup_old_service_units()

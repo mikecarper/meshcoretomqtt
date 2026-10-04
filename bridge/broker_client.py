@@ -238,10 +238,31 @@ class PahoBrokerClient(BrokerClient):
     def disconnect(self) -> None:
         self._client.disconnect()
 
+    def disconnect_gracefully(self, *, timeout: float = 1.0) -> bool:
+        """Give the network loop a bounded chance to send DISCONNECT.
+
+        Paho queues DISCONNECT when its background loop is running. Closing
+        the socket immediately after disconnect() would trigger the broker's
+        will and overwrite a confirmed final status. Socket closure is public
+        lifecycle evidence; an expired wait still permits forced retirement.
+        """
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout < 0):
+            raise ValueError('timeout must be a finite nonnegative number')
+        self.disconnect()
+        deadline = time.monotonic() + timeout
+        while self._client.socket() is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.005, remaining))
+        return True
+
     def abort(self) -> None:
         """Close a retired transport without waiting behind queued publishes.
 
-        Call after disconnect(). Paho queues DISCONNECT behind outstanding
+        Close before DISCONNECT when preserving the broker's will, or after
+        a graceful attempt expires. Paho queues DISCONNECT behind outstanding
         QoS 0 data, so loop_stop() can otherwise wait for a nonreading peer's
         keepalive timeout. TCP, TLS and WebSocket transports expose close()
         through Paho's public socket() API. Retired logs are best effort.
@@ -261,13 +282,17 @@ class PahoBrokerClient(BrokerClient):
         Completion means socket transmission for QoS 0 and acknowledgment for
         QoS 1/2. The supervisor retires connections with expired publications.
         """
+        return self._publish_receipt(topic, payload, qos, retain) is not None
+
+    def _publish_receipt(self, topic: str, payload: str, qos: int, retain: bool) -> mqtt.MQTTMessageInfo | None:
+        """Reserve the shared budget and return only an accepted public receipt."""
         if not self.is_connected:
             self._pending.reject()
-            return False
+            return None
         size = len(topic.encode('utf-8')) + len(payload.encode('utf-8')) + 32
         reservation = self._pending.reserve(size)
         if reservation is None:
-            return False
+            return None
         try:
             result = self._client.publish(topic, payload, qos=qos, retain=retain)
         except (ValueError, TypeError):
@@ -285,7 +310,32 @@ class PahoBrokerClient(BrokerClient):
             result.is_published,
             may_be_queued=result.rc != mqtt.MQTT_ERR_QUEUE_SIZE,
         )
-        return accepted
+        return result if accepted else None
+
+    def publish_confirmed(
+        self, topic: str, payload: str, qos: int = 1, retain: bool = False,
+        *, timeout: float = 2.0,
+    ) -> bool:
+        """Wait a bounded time for this receipt, never from a Paho callback.
+
+        QoS 1/2 requires broker acknowledgment; QoS 0 proves socket handoff
+        only. Failure must not be treated as permission to suppress the LWT.
+        The optional method leaves external BrokerClient implementations valid.
+        """
+        if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout < 0:
+            raise ValueError('timeout must be a finite nonnegative number')
+        if timeout == 0:
+            return False
+        receipt = self._publish_receipt(topic, payload, qos, retain)
+        if receipt is None:
+            return False
+        try:
+            receipt.wait_for_publish(timeout=timeout)
+            return receipt.is_published()
+        except (ValueError, RuntimeError):
+            return False
+        finally:
+            self._pending.complete()
 
     def _on_publish(self, client: Any, userdata: Any, mid: int, reason_code: Any, properties: Any) -> None:
         self._pending.complete()

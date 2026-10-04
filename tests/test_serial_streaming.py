@@ -157,6 +157,46 @@ def test_full_companion_bare_response_and_unframed_prompt():
         assert queued_lines(radio.connection) == []
 
 
+@pytest.mark.parametrize("name", [
+    "DEBUGNode", "BLE: relay", "MQTT: relay", "WiFi: relay",
+    "RX, len=2", "19:00:00 - 3/10/2026 node", "get name",
+])
+@pytest.mark.parametrize("echo", [True, False])
+def test_indented_companion_getter_value_is_not_classified_as_log(name, echo):
+    reply = ("get name\r\n" if echo else "") + f"  > {name}\r\n> "
+    with PtyRadio({"get name": reply.encode()}) as radio:
+        assert radio.connection.get_name() == name
+        assert radio.connection.is_open
+        assert queued_lines(radio.connection) == []
+
+
+@pytest.mark.parametrize("name", ["RAW: relay", "RX, len=2", "TX, len=2"])
+def test_legacy_arrow_getter_value_is_not_classified_as_log(name):
+    log = "19:00:00 - 3/10/2026 U RAW: AABB"
+    reply = f"get name\r\n{log}\r\n  -> >{name}\r\n"
+    with PtyRadio({"get name": reply.encode()}) as radio:
+        assert radio.connection.get_name() == name
+        assert radio.connection.is_open
+        assert queued_lines(radio.connection) == [log]
+
+
+@pytest.mark.parametrize("method, command, value", [
+    ("get_name", "get name", "FullNode"),
+    ("get_name", "get name", "DEBUGNode"),
+    ("get_pubkey", "get public.key", "AA" * 32),
+])
+def test_fragmented_getter_prefix_survives_multiple_quiet_reader_polls(method, command, value):
+    def reply(request):
+        radio.send(f"{request}\r\n  > ".encode())
+        time.sleep(0.08)  # Four quiet polls; still before the command deadline.
+        return f"{value}\r\n> ".encode()
+
+    with PtyRadio(reply) as radio:
+        assert getattr(radio.connection, method)() == value
+        assert radio.connection.is_open
+        assert queued_lines(radio.connection) == []
+
+
 def test_prompt_prefixed_log_is_demultiplexed_from_bare_command_reply():
     raw = "19:00:00 - 3/10/2026 U RAW: AABB"
     with PtyRadio({"board": f"> {raw}\nboard\n  Station G2\n> ".encode()}) as radio:
@@ -256,14 +296,15 @@ def test_close_wakes_command_wait_and_stops_reader_without_command_lock():
 
 def test_real_pty_write_backpressure_is_bounded_by_command_deadline():
     # Leave the PTY master unread. Fill its finite receive capacity, then issue
-    # a command: pyserial must time out its write rather than stall shutdown.
+    # a command. Some kernels admit the tiny write after the oversized one
+    # times out; either write or reply must hit the bounded command deadline.
     with PtyRadio(write_timeout=0.05) as radio:
         radio.port.write_timeout = 0.05
         with pytest.raises(serial.SerialTimeoutException):
             radio.port.write(b"x" * 1024 * 1024)
         started = time.monotonic()
         ok, message = radio.connection.execute_command("ver", timeout=0.08)
-        assert not ok and "timeout" in message.lower()
+        assert not ok and any(text in message.lower() for text in ("timeout", "timed out"))
         assert time.monotonic() - started < 0.5
         assert not radio.connection.is_open
 
@@ -380,6 +421,70 @@ def test_connect_respects_persistent_path_config_and_exclusive_open(tmp_path):
             assert connection.read_line() == "DEBUG: connected"
         finally:
             connection.close()
+
+
+@pytest.mark.parametrize("wrong_reply", [
+    "  -> >" + "BB" * 32 + "\r\n",
+    "  -> >ABCD\r\n",
+    "",  # An openable logging-only endpoint does not answer CLI queries.
+])
+def test_reconnect_scans_past_wrong_or_unverifiable_port(wrong_reply):
+    from bridge.runner import _reconnect_device
+    from tests.fakes import make_test_state
+
+    with PtyRadio({"get public.key": wrong_reply.encode()}) as wrong, PtyRadio({
+        "get public.key": ("  -> >" + "AA" * 32 + "\r\n").encode(),
+    }) as right:
+        # Keep the real slave terminals present while releasing the fixture's
+        # initial exclusive sessions. Otherwise a PTY responder receives EIO
+        # between sessions, unlike an attached USB radio.
+        hold_wrong = serial.Serial(wrong.path)
+        hold_right = serial.Serial(right.path)
+        connection = None
+        try:
+            wrong.connection.close()
+            right.connection.close()
+            state = make_test_state(config={"serial": {
+                "ports": [wrong.path, right.path], "command_timeout": 0.15,
+            }}, repeater_pub_key="AA" * 32)
+            connection = _reconnect_device(state, connect)
+            assert connection is not None
+            assert connection._port.port == right.path
+            assert wrong.commands == ["get public.key"]
+            assert right.commands == ["get public.key", "get public.key"]
+            assert connection.is_open
+            # Rejected candidate ownership is released before returning.
+            probe = serial.Serial(wrong.path, exclusive=True)
+            probe.close()
+        finally:
+            if connection is not None:
+                connection.close()
+            hold_wrong.close()
+            hold_right.close()
+
+
+def test_identity_aware_factory_normalizes_expected_key_and_releases_mismatch():
+    with PtyRadio({"get public.key": ("  -> >" + "AA" * 32 + "\r\n").encode()}) as radio:
+        hold = serial.Serial(radio.path)
+        connection = None
+        try:
+            radio.connection.close()
+            config = {"serial": {"ports": [radio.path], "command_timeout": 0.15}}
+            assert connect(config, expected_public_key="BB" * 32) is None
+            probe = serial.Serial(radio.path, exclusive=True)
+            probe.close()
+            connection = connect(config, expected_public_key="aa" * 32)
+            assert connection is not None and connection.is_open
+        finally:
+            if connection is not None:
+                connection.close()
+            hold.close()
+
+
+@pytest.mark.parametrize("invalid_key", ["", "AA", "GG" * 32, 42])
+def test_identity_aware_factory_rejects_invalid_expected_key_without_opening(invalid_key):
+    assert connect({"serial": {"ports": ["/dev/nonexistent"]}},
+                   expected_public_key=invalid_key) is None
 
 
 def test_connect_accepts_legacy_nonblocking_timeout_without_busy_poll():

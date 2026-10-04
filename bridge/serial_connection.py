@@ -147,9 +147,19 @@ class RealSerialConnection(SerialConnection):
         with self._condition:
             if self._stop.is_set():
                 return
+            # Companion explicitly indents getter replies by two spaces;
+            # legacy firmware prefixes the same value with an arrow.
+            # Keep that framing before stripping whitespace: a legitimate
+            # name such as DEBUGNode or BLE: relay is not an unsolicited log.
+            getter_reply = bool(
+                self._active_command is not None
+                and self._active_command.lower().startswith("get ")
+                and not self._response_done
+                and (line.startswith("  >") or stripped.startswith("-> >"))
+            )
             # An unframed terminal prompt may prefix the next unsolicited log
             # or the next command echo. Do not strip '> value' getter replies.
-            if stripped.startswith("> "):
+            if not getter_reply and stripped.startswith("> "):
                 tail = stripped[2:].lstrip()
                 if tail == self._active_command or self._is_log_record(tail):
                     # Full Companion's final prompt has no newline. A log
@@ -162,7 +172,7 @@ class RealSerialConnection(SerialConnection):
                         self._response_done = True
                         self._condition.notify_all()
                     stripped = tail
-            if self._is_log_record(stripped):
+            if not getter_reply and self._is_log_record(stripped):
                 self._queue_line_locked(stripped)
                 return
             if self._active_command is None or self._response_done:
@@ -237,11 +247,15 @@ class RealSerialConnection(SerialConnection):
                         self._dispatch_line(pending.decode(errors="replace"))
                         pending.clear()
                 # Full Companion ends replies with an unframed '> ' prompt.
-                # Wait for one quiet read poll, so fragmented '> value' getter
-                # replies are not normally mistaken for the final prompt.
+                # Complete it after a quiet poll only once a reply exists.
+                # Before then, keep a fragmented '> value' prefix intact.
                 if not data and bytes(pending).strip() == b">":
-                    self._dispatch_line(">")
-                    pending.clear()
+                    with self._condition:
+                        final_or_idle_prompt = (self._active_command is None
+                                                or bool(self._response_lines))
+                    if final_or_idle_prompt:
+                        self._dispatch_line(">")
+                        pending.clear()
         except (serial.SerialException, OSError, TypeError) as exc:
             if not self._stop.is_set():
                 with self._condition:
@@ -344,7 +358,7 @@ class RealSerialConnection(SerialConnection):
         logger.debug(f"Raw response: {response}")
 
         if "-> >" in response:
-            name = response.split("-> >")[1].strip()
+            name = response.split("-> >", 1)[1].strip()
             if '\n' in name:
                 name = name.split('\n')[0]
             name = name.replace('\r', '').strip()
@@ -359,7 +373,7 @@ class RealSerialConnection(SerialConnection):
         logger.debug(f"Raw response: {response}")
 
         if "-> >" in response:
-            pub_key = response.split("-> >")[1].strip()
+            pub_key = response.split("-> >", 1)[1].strip()
             if '\n' in pub_key:
                 pub_key = pub_key.split('\n')[0]
             pub_key_clean = pub_key.replace(' ', '').replace('\r', '').replace('\n', '')
@@ -379,18 +393,16 @@ class RealSerialConnection(SerialConnection):
         response = self._send("get prv.key\r\n", delay=1.0)
 
         if "-> >" in response:
-            priv_key = response.split("-> >")[1].strip()
+            priv_key = response.split("-> >", 1)[1].strip()
             if '\n' in priv_key:
                 priv_key = priv_key.split('\n')[0]
 
             priv_key_clean = priv_key.replace(' ', '').replace('\r', '').replace('\n', '')
             if len(priv_key_clean) == 128:
-                try:
-                    int(priv_key_clean, 16)
+                if all(c in '0123456789ABCDEFabcdef' for c in priv_key_clean):
                     logger.info(f"Repeater priv key: {priv_key_clean[:4]}... (truncated for security)")
                     return priv_key_clean
-                except ValueError as e:
-                    logger.error(f"Response not valid hex: {priv_key_clean[:32]}... Error: {e}")
+                logger.error("Private key response contains non-hexadecimal characters")
             else:
                 logger.error(f"Response wrong length: {len(priv_key_clean)} (expected 128)")
 
@@ -402,7 +414,7 @@ class RealSerialConnection(SerialConnection):
         logger.debug(f"Raw radio response: {response}")
 
         if "-> >" in response:
-            radio_info = response.split("-> >")[1].strip()
+            radio_info = response.split("-> >", 1)[1].strip()
             if '\n' in radio_info:
                 radio_info = radio_info.split('\n')[0]
             logger.debug(f"Parsed radio info: {radio_info}")
@@ -596,8 +608,13 @@ class RealSerialConnection(SerialConnection):
         return not self._stop.is_set() and getattr(self._port, 'is_open', False)
 
 
-def connect(config: dict[str, Any]) -> RealSerialConnection | None:
-    """Try configured serial ports and return the first successful connection."""
+def connect(config: dict[str, Any], *, expected_public_key: str | None = None) -> RealSerialConnection | None:
+    """Try candidates, optionally requiring the startup radio's identity."""
+    if expected_public_key is not None:
+        if not isinstance(expected_public_key, str) or not re.fullmatch(r"[0-9A-Fa-f]{64}", expected_public_key):
+            logger.error("Expected serial public key must be 64 hexadecimal characters")
+            return None
+        expected_public_key = expected_public_key.upper()
     serial_cfg = config.get('serial', {})
     ports = serial_cfg.get('ports', ['/dev/ttyACM0'])
     baud_rate = serial_cfg.get('baud_rate', 115200)
@@ -619,6 +636,7 @@ def connect(config: dict[str, Any]) -> RealSerialConnection | None:
 
     for port in ports:
         ser = None
+        connection = None
         try:
             ser = serial.Serial(
                 port=port,
@@ -638,10 +656,16 @@ def connect(config: dict[str, Any]) -> RealSerialConnection | None:
                 line_timeout=serial_cfg.get('line_timeout', 5.0),
                 command_timeout=serial_cfg.get('command_timeout', 10.0),
             )
+            if expected_public_key is not None and connection.get_pubkey() != expected_public_key:
+                logger.warning("Serial identity mismatch or unavailable on %s; trying next candidate", port)
+                connection.close()
+                continue
             logger.info(f"Connected to {port}")
             return connection
         except (serial.SerialException, OSError, ValueError, TypeError) as e:
-            if ser is not None:
+            if connection is not None:
+                connection.close()
+            elif ser is not None:
                 ser.close()
             logger.warning(f"Failed to connect to {port}: {str(e)}")
             continue

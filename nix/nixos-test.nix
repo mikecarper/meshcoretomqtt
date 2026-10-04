@@ -42,7 +42,7 @@
           enable = true;
           package = mockMctomqtt;
           iata = "SEA";
-          serialPorts = ["/dev/ttyS1"];
+          serialPorts = ["/dev/serial/by-id/usb-Missing-if00" "/dev/ttyS1"];
           defaults.letsmesh-us.enable = false;
           defaults.letsmesh-eu.enable = true;
 
@@ -72,9 +72,11 @@
       };
 
       testScript = ''
+        import shlex
         import tomllib
 
         start_all()
+        machine.succeed("test ! -e /dev/serial/by-id/usb-Missing-if00")
 
         # Wait for the service to start
         machine.wait_for_unit("mctomqtt.service")
@@ -104,7 +106,7 @@
             assert config["general"]["sync_time"] is True, f"sync_time: {config['general']['sync_time']}"
 
         with subtest("Serial section"):
-            assert "/dev/ttyS1" in config["serial"]["ports"], f"ports: {config['serial']['ports']}"
+            assert config["serial"]["ports"] == ["/dev/serial/by-id/usb-Missing-if00", "/dev/ttyS1"], f"ports: {config['serial']['ports']}"
             assert config["serial"]["baud_rate"] == 9600, f"baud_rate: {config['serial']['baud_rate']}"
             assert config["serial"]["timeout"] == 5, f"timeout: {config['serial']['timeout']}"
 
@@ -157,9 +159,17 @@
             assert custom["auth"]["username"] == "user1"
             assert custom["auth"]["password"] == "pass1"
 
-        with subtest("Service dependencies on serial device"):
-            machine.succeed("systemctl show mctomqtt.service | grep 'After='    | grep -q 'dev-ttyS1.device'")
-            machine.succeed("systemctl show mctomqtt.service | grep 'Requires=' | grep -q 'dev-ttyS1.device'")
+        with subtest("Optional serial candidates do not block service startup"):
+            requires = machine.succeed("systemctl show -p Requires --value mctomqtt.service").split()
+            after = machine.succeed("systemctl show -p After --value mctomqtt.service").split()
+            writable = machine.succeed("systemctl show -p ReadWritePaths --value mctomqtt.service").split()
+            for port in config["serial"]["ports"]:
+                device_unit = machine.succeed("systemd-escape --path --suffix=device " + shlex.quote(port)).strip()
+                assert device_unit not in requires, f"Mandatory serial dependency: {device_unit}"
+                assert device_unit not in after, f"Mandatory serial ordering: {device_unit}"
+                assert port not in writable, f"Mandatory writable serial path: {port}"
+            assert not any(path.startswith("/dev/") for path in writable), f"Device ReadWritePaths: {writable}"
+            assert "network-online.target" in after
 
         with subtest("Service user and security"):
             machine.succeed("systemctl show mctomqtt.service | grep -q 'User=mctomqtt'")

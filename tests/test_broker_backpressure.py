@@ -210,6 +210,12 @@ class TestPublishBudget:
 
 
 class TestPahoBoundedPublishing:
+    @pytest.mark.parametrize('timeout', [True, -1, float('nan'), float('inf'), '1'])
+    def test_graceful_disconnect_rejects_invalid_timeout(self, timeout):
+        client = PahoBrokerClient('invalid-disconnect-test')
+        with pytest.raises(ValueError, match='finite nonnegative'):
+            client.disconnect_gracefully(timeout=timeout)
+
     @pytest.mark.parametrize('kwargs', [
         {'max_pending_messages': 0}, {'max_pending_messages': True},
         {'max_pending_messages': 65536}, {'max_pending_bytes': 0},
@@ -301,6 +307,27 @@ class TestPahoBoundedPublishing:
                 assert client.pending_messages <= 2
                 assert client.pending_bytes <= 70000
             assert client.pending_messages > 0
+        finally:
+            close_client(client, receiver)
+
+    def test_graceful_disconnect_wait_is_bounded_with_nonreading_peer(self):
+        receiver = LocalMqttReceiver(read_packets=False)
+        client = connect_client(
+            receiver, max_pending_messages=2, max_pending_bytes=70000,
+            publish_timeout=0.05, threaded=True,
+        )
+        client.raw_client.socket().setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        try:
+            deadline = time.monotonic() + 2
+            while not client.publish_stalled and time.monotonic() < deadline:
+                client.publish('test', 'X' * 32768)
+                time.sleep(0.001)
+            assert client.publish_stalled
+            started = time.monotonic()
+            assert not client.disconnect_gracefully(timeout=0.02)
+            assert time.monotonic() - started < 0.5
+            client.abort()
+            client.loop_stop()
         finally:
             close_client(client, receiver)
 

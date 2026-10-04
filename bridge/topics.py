@@ -1,6 +1,7 @@
 """Topic resolution and broker config helpers."""
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any, TYPE_CHECKING
 
@@ -48,8 +49,17 @@ def get_topic(state: BridgeState, topic_type: str, broker_idx: int | None = None
     return resolve_topic_template(state, global_topic, broker_idx)
 
 
-def sanitize_client_id(name: str, prefix: str = "meshcore_") -> str:
-    """Convert a name to a valid MQTT client ID."""
-    client_id = prefix + name.replace(" ", "_")
+def sanitize_client_id(name: str, prefix: str = "meshcore_", *, suffix: str = "") -> str:
+    """Keep short IDs readable; preserve identity when the 23-byte limit bites.
+
+    Truncating the combined prefix and public key can remove every identity
+    byte. Hash the complete identity (including a broker suffix) instead, with
+    a small readable prefix and a 64-bit digest inside the portable limit.
+    """
+    client_id = prefix + name.replace(" ", "_") + suffix
     client_id = re.sub(r"[^a-zA-Z0-9_-]", "", client_id)
-    return client_id[:23]
+    if len(client_id) <= 23:
+        return client_id
+    label = re.sub(r"[^a-zA-Z0-9_-]", "", prefix).rstrip("_-")[:6].rstrip("_-")
+    digest = hashlib.sha256((prefix + "\0" + name + "\0" + suffix).encode('utf-8')).hexdigest()[:16]
+    return (label + "_" if label else "") + digest
